@@ -3,15 +3,15 @@ const CONFIG_FILE = 'auth_data.json';
 const SESSION_COOKIE_NAME = 'web_auth_session';
 const MAX_BACKUPS = 20; 
 
-// --- PWA 配置 (新添加) ---
-const PWA_VERSION = 'v1.0.0'; // 更新此版本号可强制更新客户端缓存
+// --- PWA 配置 ---
+const PWA_VERSION = 'v1.0.1'; // 版本号
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // --- PWA 相关路由处理 (优先处理静态资源) ---
+    // --- PWA 静态资源路由 ---
     if (path === '/manifest.json') return handleManifest();
     if (path === '/sw.js') return handleServiceWorker();
     if (path === '/app-icon.svg') return handleAppIcon();
@@ -20,7 +20,7 @@ export default {
     const configObj = await env.DB.get(CONFIG_FILE);
     let config = configObj ? await configObj.json() : null;
 
-    // 1. 初始化
+    // 1. 初始化 (未配置时)
     if (!config) {
       if (path === '/setup' && request.method === 'POST') return await handleSetup(request, env);
       return new Response(renderSetupPage(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
@@ -51,7 +51,7 @@ export default {
   }
 };
 
-// --- PWA 处理函数 (新添加) ---
+// --- PWA 处理函数 ---
 
 function handleManifest() {
     const manifest = {
@@ -71,7 +71,6 @@ function handleManifest() {
 }
 
 function handleAppIcon() {
-    // 一个简单的盾牌锁 SVG 图标
     const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="background:#2563eb;border-radius:20%">
       <rect width="512" height="512" fill="#2563eb"/>
@@ -91,9 +90,7 @@ function handleServiceWorker() {
     ];
 
     self.addEventListener('install', event => {
-        event.waitUntil(
-            caches.open(CACHE_NAME).then(cache => cache.addAll(URLS_TO_CACHE))
-        );
+        event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(URLS_TO_CACHE)));
         self.skipWaiting();
     });
 
@@ -111,14 +108,10 @@ function handleServiceWorker() {
     });
 
     self.addEventListener('fetch', event => {
-        // 策略：网络优先，失败则使用缓存 (Network First, fall back to cache)
-        // 这样可以确保有网时是最新数据，没网时也能打开界面查看验证码
         if (event.request.method !== 'GET') return;
-        
         event.respondWith(
             fetch(event.request)
                 .then(response => {
-                    // 只缓存有效响应
                     if (!response || response.status !== 200 || response.type !== 'basic') return response;
                     const responseToCache = response.clone();
                     caches.open(CACHE_NAME).then(cache => cache.put(event.request, responseToCache));
@@ -304,7 +297,7 @@ async function handleRestore(request, env) {
     }
 }
 
-// --- 前端 UI (PWA Header Updated) ---
+// --- 前端 UI (PWA Header & Centering Fix) ---
 
 const commonHead = `
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -339,7 +332,6 @@ const commonHead = `
   body { font-family: -apple-system, sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 20px 15px; display: flex; justify-content: center; transition: background-color 0.3s, color 0.3s; min-height: 100vh; box-sizing: border-box;}
   .container { width: 100%; max-width: 440px; }
   
-  /* PWA iOS Safe Area Support */
   @supports (padding-top: env(safe-area-inset-top)) {
     body { padding-top: calc(20px + env(safe-area-inset-top)); padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
   }
@@ -416,8 +408,12 @@ const commonHead = `
 </script>
 `;
 
+// --- UI 渲染函数 (已添加居中样式) ---
+
 function renderSetupPage() {
-  return `<!DOCTYPE html><html><head><title>初始化</title>${commonHead}</head><body>
+  return `<!DOCTYPE html><html><head><title>初始化</title>${commonHead}
+  <style>body { align-items: center; }</style>
+  </head><body>
     <div class="container"><div class="card">
       <h1>☁️ 初始化验证器</h1>
       <p class="text-center text-sub">配置主账号以开启自动云备份</p>
@@ -430,7 +426,9 @@ function renderSetupPage() {
 }
 
 function renderLoginPage(isError, msg) {
-  return `<!DOCTYPE html><html><head><title>登录</title>${commonHead}</head><body>
+  return `<!DOCTYPE html><html><head><title>登录</title>${commonHead}
+  <style>body { align-items: center; }</style>
+  </head><body>
     <div class="container"><div class="card">
       <h1>🔐 登录</h1>
       ${isError ? `<p style="color:var(--danger);text-align:center;">${msg || '密码或用户名错误'}</p>` : ''}
