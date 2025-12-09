@@ -3,10 +3,18 @@ const CONFIG_FILE = 'auth_data.json';
 const SESSION_COOKIE_NAME = 'web_auth_session';
 const MAX_BACKUPS = 20; 
 
+// --- PWA 配置 (新添加) ---
+const PWA_VERSION = 'v1.0.0'; // 更新此版本号可强制更新客户端缓存
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // --- PWA 相关路由处理 (优先处理静态资源) ---
+    if (path === '/manifest.json') return handleManifest();
+    if (path === '/sw.js') return handleServiceWorker();
+    if (path === '/app-icon.svg') return handleAppIcon();
 
     // 获取配置
     const configObj = await env.DB.get(CONFIG_FILE);
@@ -42,6 +50,86 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
 };
+
+// --- PWA 处理函数 (新添加) ---
+
+function handleManifest() {
+    const manifest = {
+        name: "Cloud Authenticator",
+        short_name: "Auth",
+        start_url: "/",
+        display: "standalone",
+        background_color: "#f3f4f6",
+        theme_color: "#2563eb",
+        description: "Secure Cloudflare Worker Authenticator",
+        icons: [
+            { src: "/app-icon.svg", sizes: "192x192", type: "image/svg+xml", purpose: "any maskable" },
+            { src: "/app-icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }
+        ]
+    };
+    return new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/manifest+json' } });
+}
+
+function handleAppIcon() {
+    // 一个简单的盾牌锁 SVG 图标
+    const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="background:#2563eb;border-radius:20%">
+      <rect width="512" height="512" fill="#2563eb"/>
+      <path d="M256 48C150 48 64 134 64 240c0 88 57 163 136 186v-56c-49-20-80-69-80-125 0-75 61-136 136-136s136 61 136 136c0 56-31 105-80 125v56c79-23 136-98 136-186C448 134 362 48 256 48z" fill="#fff"/>
+      <path d="M256 208c-35.3 0-64 28.7-64 64 0 21.6 10.9 40.4 27.2 52L200 384h112l-19.2-60c16.3-11.6 27.2-30.4 27.2-52 0-35.3-28.7-64-64-64z" fill="#fff"/>
+    </svg>`.trim();
+    return new Response(svg, { headers: { 'Content-Type': 'image/svg+xml' } });
+}
+
+function handleServiceWorker() {
+    const js = `
+    const CACHE_NAME = 'auth-cache-${PWA_VERSION}';
+    const URLS_TO_CACHE = [
+        '/',
+        '/app-icon.svg',
+        'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'
+    ];
+
+    self.addEventListener('install', event => {
+        event.waitUntil(
+            caches.open(CACHE_NAME).then(cache => cache.addAll(URLS_TO_CACHE))
+        );
+        self.skipWaiting();
+    });
+
+    self.addEventListener('activate', event => {
+        event.waitUntil(
+            caches.keys().then(cacheNames => {
+                return Promise.all(
+                    cacheNames.map(cacheName => {
+                        if (cacheName !== CACHE_NAME) return caches.delete(cacheName);
+                    })
+                );
+            })
+        );
+        self.clients.claim();
+    });
+
+    self.addEventListener('fetch', event => {
+        // 策略：网络优先，失败则使用缓存 (Network First, fall back to cache)
+        // 这样可以确保有网时是最新数据，没网时也能打开界面查看验证码
+        if (event.request.method !== 'GET') return;
+        
+        event.respondWith(
+            fetch(event.request)
+                .then(response => {
+                    // 只缓存有效响应
+                    if (!response || response.status !== 200 || response.type !== 'basic') return response;
+                    const responseToCache = response.clone();
+                    caches.open(CACHE_NAME).then(cache => cache.put(event.request, responseToCache));
+                    return response;
+                })
+                .catch(() => caches.match(event.request))
+        );
+    });
+    `;
+    return new Response(js, { headers: { 'Content-Type': 'application/javascript' } });
+}
 
 // --- 安全核心工具 ---
 async function hashPassword(password, salt = null) {
@@ -216,11 +304,23 @@ async function handleRestore(request, env) {
     }
 }
 
-// --- 前端 UI ---
+// --- 前端 UI (PWA Header Updated) ---
 
 const commonHead = `
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/app-icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Auth">
+<link rel="apple-touch-icon" href="/app-icon.svg">
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW setup failed', err));
+  }
+</script>
 <style>
   :root {
     --bg: #f3f4f6; --card-bg: #ffffff; --text-main: #111827; --text-sub: #6b7280;
@@ -239,6 +339,11 @@ const commonHead = `
   body { font-family: -apple-system, sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 20px 15px; display: flex; justify-content: center; transition: background-color 0.3s, color 0.3s; min-height: 100vh; box-sizing: border-box;}
   .container { width: 100%; max-width: 440px; }
   
+  /* PWA iOS Safe Area Support */
+  @supports (padding-top: env(safe-area-inset-top)) {
+    body { padding-top: calc(20px + env(safe-area-inset-top)); padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+  }
+
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 10px; }
   .user-badge { font-size: 0.95rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 50%; display: flex; align-items: center; gap: 5px; color: var(--text-main); }
   .header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
