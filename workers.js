@@ -30,11 +30,14 @@ export default {
     const cookie = request.headers.get('Cookie');
     const isLoggedIn = cookie && cookie.includes(`${SESSION_COOKIE_NAME}=${config.sessionToken}`);
 
+    // 传递 Site Key 到登录页渲染函数
+    const siteKey = env.TURNSTILE_SITE_KEY || null;
+
     if (path === '/login' && request.method === 'POST') return await handleLogin(request, env, config);
     if (path === '/logout') return logoutResponse();
 
     if (!isLoggedIn) {
-      return new Response(renderLoginPage(false, null), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
     // --- 登录后功能 ---
@@ -145,6 +148,22 @@ async function verifyPassword(input, stored) {
     return newHash.split('$')[1] === hash;
 }
 
+// --- Turnstile 验证工具 ---
+async function verifyTurnstileToken(secret, token, ip) {
+    const formData = new FormData();
+    formData.append('secret', secret);
+    formData.append('response', token);
+    formData.append('remoteip', ip);
+
+    const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+        body: formData,
+        method: 'POST',
+    });
+
+    const outcome = await result.json();
+    return outcome.success;
+}
+
 async function saveDataWithBackup(env, data) {
     const jsonString = JSON.stringify(data);
     await env.DB.put(CONFIG_FILE, jsonString);
@@ -196,23 +215,40 @@ async function handleSetup(request, env) {
 }
 
 async function handleLogin(request, env, config) {
+  // Turnstile 站点密钥和私钥都存在时，才进行验证
+  const siteKey = env.TURNSTILE_SITE_KEY;
+  const secretKey = env.TURNSTILE_SECRET_KEY;
+  
   await new Promise(r => setTimeout(r, 2000)); 
   const now = Date.now();
   if (config.security && config.security.lockoutUntil > now) {
       const waitMin = Math.ceil((config.security.lockoutUntil - now) / 60000);
-      return new Response(renderLoginPage(true, `已锁定，请 ${waitMin} 分钟后再试`), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      return new Response(renderLoginPage(true, `已锁定，请 ${waitMin} 分钟后再试`, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
   const formData = await request.formData();
   const inputUser = formData.get('username');
   const inputPass = formData.get('password');
+  const turnstileToken = formData.get('cf-turnstile-response');
+
+  // --- Turnstile 验证逻辑 ---
+  if (secretKey && siteKey) {
+      if (!turnstileToken) {
+          return new Response(renderLoginPage(true, '请完成人机验证', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      }
+      const ip = request.headers.get('CF-Connecting-IP');
+      const isVerified = await verifyTurnstileToken(secretKey, turnstileToken, ip);
+      if (!isVerified) {
+          return new Response(renderLoginPage(true, '人机验证失败，请重试', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      }
+  }
 
   if (inputUser !== config.username || (await verifyPassword(inputPass, config.password)) === false) {
       if (!config.security) config.security = { failedAttempts: 0, lockoutUntil: 0 };
       config.security.failedAttempts += 1;
       if (config.security.failedAttempts >= 5) config.security.lockoutUntil = Date.now() + 15 * 60 * 1000;
       await saveDataWithBackup(env, config);
-      return new Response(renderLoginPage(true, '用户名或密码错误'), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
   if ((await verifyPassword(inputPass, config.password)) === 'LEGACY_MATCH') config.password = await hashPassword(inputPass);
@@ -297,7 +333,7 @@ async function handleRestore(request, env) {
     }
 }
 
-// --- 前端 UI (PWA Header & Centering Fix) ---
+// --- 前端 UI ---
 
 const commonHead = `
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -408,7 +444,7 @@ const commonHead = `
 </script>
 `;
 
-// --- UI 渲染函数 (已更新现代化登录页) ---
+// --- UI 渲染函数 ---
 
 function renderSetupPage() {
   return `<!DOCTYPE html><html><head><title>初始化</title>${commonHead}
@@ -425,7 +461,7 @@ function renderSetupPage() {
     </div></div></body></html>`;
 }
 
-function renderLoginPage(isError, msg) {
+function renderLoginPage(isError, msg, siteKey) {
   // 提取应用图标SVG，用于登录页展示
   const appIconSvg = `
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width:64px;height:64px;border-radius:14px;box-shadow:0 8px 15px -3px rgba(37, 99, 235, 0.3);">
@@ -435,6 +471,7 @@ function renderLoginPage(isError, msg) {
   </svg>`;
 
   return `<!DOCTYPE html><html><head><title>登录 - Cloud Auth</title>${commonHead}
+  ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
   <style>
     body { align-items: center; background: var(--bg); }
     .login-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; }
@@ -461,6 +498,9 @@ function renderLoginPage(isError, msg) {
         padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
     }
     .toggle-password:hover { background: var(--list-hover); color: var(--text-main); }
+    
+    /* Turnstile 样式 */
+    .turnstile-container { display: flex; justify-content: center; margin-bottom: 15px; min-height: 65px; }
 
     /* 按钮加载状态 */
     .btn.loading { position: relative; color: transparent; pointer-events: none; }
@@ -504,7 +544,9 @@ function renderLoginPage(isError, msg) {
             </button>
           </div>
 
-          <button type="submit" class="btn" style="margin-top: 10px; padding: 14px;">立即登录</button>
+          ${siteKey ? `<div class="turnstile-container"><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="auto"></div></div>` : ''}
+
+          <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">立即登录</button>
         </form>
       </div>
       
@@ -878,17 +920,14 @@ function renderDashboard(username, accounts) {
                   }
                   barEl.style.width = \`\${percent}%\`;
                   
-                  // --- 颜色逻辑修改：绿 -> 蓝 -> 红 ---
+                  // --- 颜色逻辑：绿 -> 蓝 -> 红 ---
                   if (percent < 15) {
-                      // 剩余时间 < 15% (最后4.5秒) -> 红色 (危险/即将过期)
                       barEl.style.background = 'var(--danger)';
                       codeEl.style.color = 'var(--danger)';
                   } else if (percent < 50) {
-                      // 剩余时间 < 50% (最后15秒) -> 蓝色 (正常/中间状态)
                       barEl.style.background = 'var(--primary)';
                       codeEl.style.color = 'var(--code-color)';
                   } else {
-                      // 剩余时间 > 50% (前15秒) -> 绿色 (安全/新生成)
                       barEl.style.background = '#10b981';
                       codeEl.style.color = '#10b981';
                   }
