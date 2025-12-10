@@ -47,3 +47,13 @@ R2 Bucket: 选择你刚才创建的 auth-store。
 调用相机：点击后会请求摄像头权限，并在弹窗内显示取景框。
 
 自动识别：识别到二维码后，会自动解析 otpauth:// 链接，自动填入 服务商 和 密钥，并关闭摄像头。
+
+# 登录添加Turnstile验证
+⚠️ 部署前必做
+请在 Cloudflare Workers 的 Settings -> Variables 中添加以下环境变量：
+
+TURNSTILE_SITE_KEY: 你的 Turnstile 站点密钥 (Site Key)
+
+TURNSTILE_SECRET_KEY: 你的 Turnstile 密钥 (Secret Key)
+
+如果不添加这两个变量，系统将自动回退到无验证码模式（旧版逻辑），不会报错。
