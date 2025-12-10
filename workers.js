@@ -408,7 +408,7 @@ const commonHead = `
 </script>
 `;
 
-// --- UI 渲染函数 (已添加居中样式) ---
+// --- UI 渲染函数 (已更新现代化登录页) ---
 
 function renderSetupPage() {
   return `<!DOCTYPE html><html><head><title>初始化</title>${commonHead}
@@ -426,19 +426,109 @@ function renderSetupPage() {
 }
 
 function renderLoginPage(isError, msg) {
-  return `<!DOCTYPE html><html><head><title>登录</title>${commonHead}
-  <style>body { align-items: center; }</style>
+  // 提取应用图标SVG，用于登录页展示
+  const appIconSvg = `
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width:64px;height:64px;border-radius:14px;box-shadow:0 8px 15px -3px rgba(37, 99, 235, 0.3);">
+    <rect width="512" height="512" fill="#2563eb"/>
+    <path d="M256 48C150 48 64 134 64 240c0 88 57 163 136 186v-56c-49-20-80-69-80-125 0-75 61-136 136-136s136 61 136 136c0 56-31 105-80 125v56c79-23 136-98 136-186C448 134 362 48 256 48z" fill="#fff"/>
+    <path d="M256 208c-35.3 0-64 28.7-64 64 0 21.6 10.9 40.4 27.2 52L200 384h112l-19.2-60c16.3-11.6 27.2-30.4 27.2-52 0-35.3-28.7-64-64-64z" fill="#fff"/>
+  </svg>`;
+
+  return `<!DOCTYPE html><html><head><title>登录 - Cloud Auth</title>${commonHead}
+  <style>
+    body { align-items: center; background: var(--bg); }
+    .login-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; }
+    
+    /* Logo 区域 */
+    .brand-section { text-align: center; margin-bottom: 2rem; }
+    .brand-title { font-size: 1.5rem; font-weight: 700; color: var(--text-main); margin-top: 15px; letter-spacing: -0.5px; }
+    .brand-subtitle { font-size: 0.9rem; color: var(--text-sub); margin-top: 5px; }
+
+    /* 输入框组样式 */
+    .input-group { position: relative; margin-bottom: 1.2rem; }
+    .input-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--text-sub); pointer-events: none; z-index: 2; transition: color 0.2s; }
+    .input-field { 
+        padding-left: 48px !important; /* 为图标留出空间 */
+        transition: all 0.2s; 
+        background: var(--input-bg);
+    }
+    .input-field:focus + .input-icon { color: var(--primary); }
+    
+    /* 密码切换按钮 */
+    .toggle-password { 
+        position: absolute; right: 12px; top: 50%; transform: translateY(-50%); 
+        background: none; border: none; cursor: pointer; color: var(--text-sub); 
+        padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    }
+    .toggle-password:hover { background: var(--list-hover); color: var(--text-main); }
+
+    /* 按钮加载状态 */
+    .btn.loading { position: relative; color: transparent; pointer-events: none; }
+    .btn.loading::after {
+        content: ""; position: absolute; top: 50%; left: 50%; width: 20px; height: 20px;
+        margin-top: -10px; margin-left: -10px; border: 2px solid #fff; border-top-color: transparent;
+        border-radius: 50%; animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
   </head><body>
-    <div class="container"><div class="card">
-      <h1>🔐 登录</h1>
-      ${isError ? `<p style="color:var(--danger);text-align:center;">${msg || '密码或用户名错误'}</p>` : ''}
-      <form action="/login" method="POST" class="mt-4">
-        <input type="text" name="username" required placeholder="用户名">
-        <input type="password" name="password" required placeholder="密码">
-        <button type="submit" class="btn">登录</button>
-      </form>
-      <p class="text-center text-sub" style="font-size:0.8rem; margin-top:20px; opacity:0.7;">安全提示：多次失败将锁定账户</p>
-    </div></div></body></html>`;
+    <div class="login-container">
+      
+      <div class="brand-section">
+        ${appIconSvg}
+        <div class="brand-title">欢迎回来</div>
+        <div class="brand-subtitle">请验证您的身份以继续</div>
+      </div>
+
+      <div class="card" style="padding: 30px 25px;">
+        ${isError ? `
+        <div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;">
+            <span style="font-size:1.1rem">⚠️</span> ${msg || '用户名或密码错误'}
+        </div>` : ''}
+        
+        <form action="/login" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
+          
+          <div class="input-group">
+            <input type="text" name="username" class="input-field" required placeholder="用户名" autocomplete="username">
+            <svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+          </div>
+
+          <div class="input-group">
+            <input type="password" name="password" id="pwdInput" class="input-field" required placeholder="主密码" autocomplete="current-password">
+            <svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+            
+            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1">
+                <span id="eyeIcon">👁️</span>
+            </button>
+          </div>
+
+          <button type="submit" class="btn" style="margin-top: 10px; padding: 14px;">立即登录</button>
+        </form>
+      </div>
+      
+      <p class="text-center text-sub" style="font-size:0.8rem; margin-top:25px; opacity:0.6;">
+         Cloud Authenticator · 安全加密存储
+      </p>
+    </div>
+
+    <script>
+        function togglePwd() {
+            const input = document.getElementById('pwdInput');
+            const icon = document.getElementById('eyeIcon');
+            if (input.type === 'password') {
+                input.type = 'text';
+                icon.innerText = '🙈'; // 闭眼图标
+                icon.style.opacity = '0.7';
+            } else {
+                input.type = 'password';
+                icon.innerText = '👁️'; // 睁眼图标
+                icon.style.opacity = '1';
+            }
+        }
+    </script>
+  </body></html>`;
 }
 
 function renderDashboard(username, accounts) {
@@ -787,12 +877,20 @@ function renderDashboard(username, accounts) {
                       codeEl.style.opacity = '0.5'; setTimeout(()=>codeEl.style.opacity = '1', 200);
                   }
                   barEl.style.width = \`\${percent}%\`;
+                  
+                  // --- 颜色逻辑修改：绿 -> 蓝 -> 红 ---
                   if (percent < 15) {
+                      // 剩余时间 < 15% (最后4.5秒) -> 红色 (危险/即将过期)
                       barEl.style.background = 'var(--danger)';
                       codeEl.style.color = 'var(--danger)';
-                  } else {
+                  } else if (percent < 50) {
+                      // 剩余时间 < 50% (最后15秒) -> 蓝色 (正常/中间状态)
                       barEl.style.background = 'var(--primary)';
                       codeEl.style.color = 'var(--code-color)';
+                  } else {
+                      // 剩余时间 > 50% (前15秒) -> 绿色 (安全/新生成)
+                      barEl.style.background = '#10b981';
+                      codeEl.style.color = '#10b981';
                   }
               }
           }
