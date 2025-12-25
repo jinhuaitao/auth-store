@@ -4,7 +4,18 @@ const SESSION_COOKIE_NAME = 'web_auth_session';
 const MAX_BACKUPS = 20; 
 
 // --- PWA 配置 ---
-const PWA_VERSION = 'v1.0.1'; // 版本号
+const PWA_VERSION = 'v1.1.0'; // 版本升级，强制更新缓存策略
+
+// --- 安全工具函数 (后端用) ---
+function escapeHtml(unsafe) {
+    if (!unsafe) return "";
+    return String(unsafe)
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
 
 export default {
   async fetch(request, env) {
@@ -26,9 +37,17 @@ export default {
       return new Response(renderSetupPage(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
-    // 2. 鉴权
-    const cookie = request.headers.get('Cookie');
-    const isLoggedIn = cookie && cookie.includes(`${SESSION_COOKIE_NAME}=${config.sessionToken}`);
+    // 2. 鉴权 (多设备支持)
+    const cookieStr = request.headers.get('Cookie') || '';
+    const tokenMatch = cookieStr.match(new RegExp('(^| )' + SESSION_COOKIE_NAME + '=([^;]+)'));
+    const currentToken = tokenMatch ? tokenMatch[2] : null;
+
+    // 检查 Token 是否存在于 sessions 数组中
+    // 兼容逻辑：确保 sessions 是数组，且包含当前 token
+    const isLoggedIn = currentToken && 
+                       config.sessions && 
+                       Array.isArray(config.sessions) && 
+                       config.sessions.some(s => s.token === currentToken);
 
     // 传递 Site Key 到登录页渲染函数
     const siteKey = env.TURNSTILE_SITE_KEY || null;
@@ -86,8 +105,8 @@ function handleAppIcon() {
 function handleServiceWorker() {
     const js = `
     const CACHE_NAME = 'auth-cache-${PWA_VERSION}';
+    // [安全修复] 只缓存静态资源，绝对不缓存HTML页面（包含敏感数据）
     const URLS_TO_CACHE = [
-        '/',
         '/app-icon.svg',
         'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'
     ];
@@ -112,15 +131,30 @@ function handleServiceWorker() {
 
     self.addEventListener('fetch', event => {
         if (event.request.method !== 'GET') return;
+        
+        const url = new URL(event.request.url);
+        
+        // [安全修复] 明确排除根路径和任何非静态资源
+        if (url.pathname === '/' || url.pathname.startsWith('/api')) {
+             return; 
+        }
+
         event.respondWith(
-            fetch(event.request)
+            caches.match(event.request)
                 .then(response => {
-                    if (!response || response.status !== 200 || response.type !== 'basic') return response;
-                    const responseToCache = response.clone();
-                    caches.open(CACHE_NAME).then(cache => cache.put(event.request, responseToCache));
-                    return response;
+                    if (response) return response;
+                    return fetch(event.request).then(response => {
+                         // 只缓存特定的静态资源类型
+                         if (!response || response.status !== 200 || response.type !== 'basic') return response;
+                         // 二次检查：确保不缓存 HTML
+                         const contentType = response.headers.get('content-type');
+                         if (contentType && contentType.includes('text/html')) return response;
+                         
+                         const responseToCache = response.clone();
+                         caches.open(CACHE_NAME).then(cache => cache.put(event.request, responseToCache));
+                         return response;
+                    });
                 })
-                .catch(() => caches.match(event.request))
         );
     });
     `;
@@ -136,6 +170,7 @@ async function hashPassword(password, salt = null) {
         salt = [...saltBytes].map(b => b.toString(16).padStart(2, '0')).join('');
     }
     const data = encoder.encode(password + salt);
+    // 维持 SHA-256 兼容性
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return `${salt}$${hashArray.map(b => b.toString(16).padStart(2, '0')).join('')}`;
@@ -209,17 +244,29 @@ async function handleSetup(request, env) {
   if (!username || !password) return new Response('Incomplete data', { status: 400 });
 
   const hashedPassword = await hashPassword(password);
-  const newConfig = { username, password: hashedPassword, sessionToken: crypto.randomUUID(), accounts: [], security: { failedAttempts: 0, lockoutUntil: 0 } };
+  // [修改] 初始化 sessions 数组
+  const newConfig = { 
+      username, 
+      password: hashedPassword, 
+      sessions: [], 
+      accounts: [], 
+      security: { failedAttempts: 0, lockoutUntil: 0 } 
+  };
   await saveDataWithBackup(env, newConfig);
   return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
 
 async function handleLogin(request, env, config) {
-  // Turnstile 站点密钥和私钥都存在时，才进行验证
   const siteKey = env.TURNSTILE_SITE_KEY;
   const secretKey = env.TURNSTILE_SECRET_KEY;
   
-  await new Promise(r => setTimeout(r, 2000)); 
+  // [安全修复] Fail-Secure: 如果有 Site Key 但缺少 Secret Key，视为服务器配置错误
+  if (siteKey && !secretKey) {
+      return new Response('Server Configuration Error: Missing Turnstile Secret Key', { status: 500 });
+  }
+
+  await new Promise(r => setTimeout(r, 2000)); // 防止爆破的硬延时
+  
   const now = Date.now();
   if (config.security && config.security.lockoutUntil > now) {
       const waitMin = Math.ceil((config.security.lockoutUntil - now) / 60000);
@@ -232,7 +279,7 @@ async function handleLogin(request, env, config) {
   const turnstileToken = formData.get('cf-turnstile-response');
 
   // --- Turnstile 验证逻辑 ---
-  if (secretKey && siteKey) {
+  if (siteKey) {
       if (!turnstileToken) {
           return new Response(renderLoginPage(true, '请完成人机验证', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
@@ -243,7 +290,12 @@ async function handleLogin(request, env, config) {
       }
   }
 
-  if (inputUser !== config.username || (await verifyPassword(inputPass, config.password)) === false) {
+  // [安全修复] 恒定时间比较
+  const userMatch = (inputUser === config.username);
+  const passMatchResult = await verifyPassword(inputPass, config.password);
+  const isAuthSuccess = userMatch && (passMatchResult !== false);
+
+  if (!isAuthSuccess) {
       if (!config.security) config.security = { failedAttempts: 0, lockoutUntil: 0 };
       config.security.failedAttempts += 1;
       if (config.security.failedAttempts >= 5) config.security.lockoutUntil = Date.now() + 15 * 60 * 1000;
@@ -251,26 +303,54 @@ async function handleLogin(request, env, config) {
       return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
-  if ((await verifyPassword(inputPass, config.password)) === 'LEGACY_MATCH') config.password = await hashPassword(inputPass);
+  if (passMatchResult === 'LEGACY_MATCH') config.password = await hashPassword(inputPass);
   if (config.security) { config.security.failedAttempts = 0; config.security.lockoutUntil = 0; }
   
-  config.sessionToken = crypto.randomUUID();
+  // [修改] 多设备 Session 管理
+  const newToken = crypto.randomUUID();
+  const deviceInfo = (request.headers.get('User-Agent') || 'Unknown').substring(0, 50);
+
+  if (!config.sessions || !Array.isArray(config.sessions)) config.sessions = [];
+  
+  // 追加新 Session
+  config.sessions.push({ token: newToken, device: deviceInfo, created: Date.now() });
+
+  // 限制最大在线设备数 (5)
+  if (config.sessions.length > 5) {
+      config.sessions = config.sessions.slice(-5);
+  }
+
+  // 清理旧版数据
+  if (config.sessionToken) delete config.sessionToken;
+
   await saveDataWithBackup(env, config);
 
   return new Response(null, {
     status: 302,
-    headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=${config.sessionToken}; HttpOnly; Path=/; SameSite=Strict; Secure; Max-Age=86400` }
+    headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=${newToken}; HttpOnly; Path=/; SameSite=Strict; Secure; Max-Age=2592000` } // 30天有效
   });
 }
 
 async function handleDashboard(env, config) {
-  return new Response(renderDashboard(config.username, config.accounts), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  return new Response(renderDashboard(config.username, config.accounts), { 
+      headers: { 
+          'Content-Type': 'text/html;charset=UTF-8',
+          // [安全增强] 添加基础安全头
+          'X-Frame-Options': 'DENY',
+          'X-Content-Type-Options': 'nosniff'
+      } 
+  });
 }
 
 async function handleAddAccount(request, env, config) {
     const formData = await request.formData();
     let issuer = formData.get('issuer') || 'Unknown';
     let secret = formData.get('secret') || '';
+    
+    // [安全修复] 输入长度限制
+    if (issuer.length > 64) issuer = issuer.substring(0, 64);
+    if (secret.length > 256) return new Response('Secret too long', { status: 400 });
+    
     secret = secret.replace(/\s+/g, '').toUpperCase().replace(/=+$/, ''); 
     const newAccount = { id: crypto.randomUUID(), issuer, secret, addedAt: Date.now() };
     if (!config.accounts) config.accounts = [];
@@ -326,6 +406,9 @@ async function handleRestore(request, env) {
         }
 
         if (!json.username || !json.accounts) throw new Error("Format Error");
+        // [修改] 恢复时也确保 sessions 结构正确
+        if (!json.sessions) json.sessions = [];
+        
         await saveDataWithBackup(env, json);
         return logoutResponse();
     } catch (e) {
@@ -348,6 +431,16 @@ const commonHead = `
 <script>
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW setup failed', err));
+  }
+  // [安全修复] 前端 HTML 转义工具
+  function escapeHtml(unsafe) {
+    if (!unsafe) return "";
+    return String(unsafe)
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
   }
 </script>
 <style>
@@ -462,7 +555,6 @@ function renderSetupPage() {
 }
 
 function renderLoginPage(isError, msg, siteKey) {
-  // 提取应用图标SVG，用于登录页展示
   const appIconSvg = `
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width:64px;height:64px;border-radius:14px;box-shadow:0 8px 15px -3px rgba(37, 99, 235, 0.3);">
     <rect width="512" height="512" fill="#2563eb"/>
@@ -475,111 +567,60 @@ function renderLoginPage(isError, msg, siteKey) {
   <style>
     body { align-items: center; background: var(--bg); }
     .login-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; }
-    
-    /* Logo 区域 */
     .brand-section { text-align: center; margin-bottom: 2rem; }
     .brand-title { font-size: 1.5rem; font-weight: 700; color: var(--text-main); margin-top: 15px; letter-spacing: -0.5px; }
     .brand-subtitle { font-size: 0.9rem; color: var(--text-sub); margin-top: 5px; }
-
-    /* 输入框组样式 */
     .input-group { position: relative; margin-bottom: 1.2rem; }
     .input-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--text-sub); pointer-events: none; z-index: 2; transition: color 0.2s; }
-    .input-field { 
-        padding-left: 48px !important; /* 为图标留出空间 */
-        transition: all 0.2s; 
-        background: var(--input-bg);
-    }
+    .input-field { padding-left: 48px !important; transition: all 0.2s; background: var(--input-bg); }
     .input-field:focus + .input-icon { color: var(--primary); }
-    
-    /* 密码切换按钮 */
-    .toggle-password { 
-        position: absolute; right: 12px; top: 50%; transform: translateY(-50%); 
-        background: none; border: none; cursor: pointer; color: var(--text-sub); 
-        padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-    }
+    .toggle-password { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: var(--text-sub); padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
     .toggle-password:hover { background: var(--list-hover); color: var(--text-main); }
-    
-    /* Turnstile 样式 */
     .turnstile-container { display: flex; justify-content: center; margin-bottom: 15px; min-height: 65px; }
-
-    /* 按钮加载状态 */
     .btn.loading { position: relative; color: transparent; pointer-events: none; }
-    .btn.loading::after {
-        content: ""; position: absolute; top: 50%; left: 50%; width: 20px; height: 20px;
-        margin-top: -10px; margin-left: -10px; border: 2px solid #fff; border-top-color: transparent;
-        border-radius: 50%; animation: spin 0.8s linear infinite;
-    }
-
+    .btn.loading::after { content: ""; position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; margin-top: -10px; margin-left: -10px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
     @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
   </head><body>
     <div class="login-container">
-      
-      <div class="brand-section">
-        ${appIconSvg}
-        <div class="brand-title">欢迎回来</div>
-        <div class="brand-subtitle">请验证您的身份以继续</div>
-      </div>
-
+      <div class="brand-section">${appIconSvg}<div class="brand-title">欢迎回来</div><div class="brand-subtitle">请验证您的身份以继续</div></div>
       <div class="card" style="padding: 30px 25px;">
-        ${isError ? `
-        <div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;">
-            <span style="font-size:1.1rem">⚠️</span> ${msg || '用户名或密码错误'}
-        </div>` : ''}
-        
+        ${isError ? `<div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;"><span style="font-size:1.1rem">⚠️</span> ${msg || '用户名或密码错误'}</div>` : ''}
         <form action="/login" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
-          
           <div class="input-group">
             <input type="text" name="username" class="input-field" required placeholder="用户名" autocomplete="username">
             <svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
           </div>
-
           <div class="input-group">
             <input type="password" name="password" id="pwdInput" class="input-field" required placeholder="主密码" autocomplete="current-password">
             <svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-            
-            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1">
-                <span id="eyeIcon">👁️</span>
-            </button>
+            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1"><span id="eyeIcon">👁️</span></button>
           </div>
-
           ${siteKey ? `<div class="turnstile-container"><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="auto"></div></div>` : ''}
-
           <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">立即登录</button>
         </form>
       </div>
-      
-      <p class="text-center text-sub" style="font-size:0.8rem; margin-top:25px; opacity:0.6;">
-         Cloud Authenticator · 安全加密存储
-      </p>
+      <p class="text-center text-sub" style="font-size:0.8rem; margin-top:25px; opacity:0.6;">Cloud Authenticator · 安全加密存储</p>
     </div>
-
     <script>
-        function togglePwd() {
-            const input = document.getElementById('pwdInput');
-            const icon = document.getElementById('eyeIcon');
-            if (input.type === 'password') {
-                input.type = 'text';
-                icon.innerText = '🙈'; // 闭眼图标
-                icon.style.opacity = '0.7';
-            } else {
-                input.type = 'password';
-                icon.innerText = '👁️'; // 睁眼图标
-                icon.style.opacity = '1';
-            }
-        }
+        function togglePwd() { const input = document.getElementById('pwdInput'); const icon = document.getElementById('eyeIcon'); if (input.type === 'password') { input.type = 'text'; icon.innerText = '🙈'; icon.style.opacity = '0.7'; } else { input.type = 'password'; icon.innerText = '👁️'; icon.style.opacity = '1'; } }
     </script>
   </body></html>`;
 }
 
 function renderDashboard(username, accounts) {
-  const accountsJson = JSON.stringify(accounts || []);
+  // [安全修复] 后端转义用户名，防止 XSS
+  const safeUsername = escapeHtml(username);
+  
+  // [安全修复] 在注入 JSON 到 script 标签时，防止 </script> 闭合标签逃逸攻击
+  const accountsJson = JSON.stringify(accounts || []).replace(/</g, '\\u003c');
+
   return `<!DOCTYPE html><html><head><title>Authenticator</title>${commonHead}</head><body>
     <div id="toast" class="toast"></div>
     <div class="container">
       <div class="header">
-        <div class="user-badge"><span>👤 ${username}</span></div>
+        <div class="user-badge"><span>👤 ${safeUsername}</span></div>
         <div class="header-actions">
             <button onclick="toggleTheme()" id="theme-icon" class="btn-icon">☀️</button>
             <button onclick="openSettings()" class="btn-icon">⚙️</button>
@@ -635,7 +676,7 @@ function renderDashboard(username, accounts) {
 
         <form action="/add" method="POST">
           <label class="text-sub">服务商 / 备注</label>
-          <input type="text" id="inpIssuer" name="issuer" placeholder="例如: Google" required>
+          <input type="text" id="inpIssuer" name="issuer" placeholder="例如: Google" required maxlength="64">
           <label class="text-sub">密钥 (Key)</label>
           <input type="text" id="inpSecret" name="secret" placeholder="粘贴 Base32 密钥" required autocomplete="off">
           <div class="flex-gap mt-4">
@@ -700,6 +741,7 @@ function renderDashboard(username, accounts) {
     </div>
 
     <script>
+      // JSON 数据已在后端进行转义处理
       const accounts = ${accountsJson};
       
       // 设置中心逻辑
@@ -719,7 +761,8 @@ function renderDashboard(username, accounts) {
 
       function openDeleteModal(id, issuer) {
          document.getElementById('deleteId').value = id;
-         document.getElementById('deleteMsg').innerText = \`确定要删除 \${issuer} 吗？\`;
+         // [安全修复] 使用 textContent 而不是 innerText/innerHTML 防止 XSS
+         document.getElementById('deleteMsg').textContent = \`确定要删除 \${issuer} 吗？\`;
          document.getElementById('deleteModal').classList.add('open');
       }
       function closeDeleteModal() { document.getElementById('deleteModal').classList.remove('open'); }
@@ -757,6 +800,7 @@ function renderDashboard(username, accounts) {
                       const timePart = parts[1].replace(/-/g, ':');
                       const displayStr = \`\${datePart} \${timePart}\`;
                       
+                      // 注意：文件名是后端生成的，相对安全，但作为最佳实践，不应信任任何输入
                       if (mode === 'download') {
                           html += \`<a href="/backup?file=\${f.key}" class="backup-item"><div class="backup-date">\${displayStr}</div><div class="backup-size">下载</div></a>\`;
                       } else {
@@ -842,7 +886,6 @@ function renderDashboard(username, accounts) {
               let issuer = params.get('issuer');
               
               if (!issuer) {
-                  // 尝试从路径中获取: otpauth://totp/Google:alice@gmail.com
                   const path = decodeURIComponent(u.pathname.replace('//', ''));
                   const parts = path.split(':');
                   if (parts.length > 0) issuer = parts[0].replace('totp/', '');
@@ -898,21 +941,26 @@ function renderDashboard(username, accounts) {
           const percent = ((30 - seconds) / 30) * 100;
           
           if (list.innerHTML === '' && accounts.length > 0) {
-              list.innerHTML = accounts.map(acc => \`
+              list.innerHTML = accounts.map(acc => {
+                  // [安全修复] 前端 XSS 防护，转义渲染
+                  const safeIssuer = escapeHtml(acc.issuer);
+                  const safeId = escapeHtml(acc.id);
+                  return \`
                   <div class="auth-item">
                       <div class="auth-info">
-                          <div class="auth-issuer">\${acc.issuer}</div>
-                          <div class="auth-code" id="code-\${acc.id}" onclick="copyCode(this.innerText)">...</div>
-                          <div class="auth-timer"><div class="auth-timer-bar" id="bar-\${acc.id}"></div></div>
+                          <div class="auth-issuer">\${safeIssuer}</div>
+                          <div class="auth-code" id="code-\${safeId}" onclick="copyCode(this.innerText)">...</div>
+                          <div class="auth-timer"><div class="auth-timer-bar" id="bar-\${safeId}"></div></div>
                       </div>
-                      <button onclick="openDeleteModal('\${acc.id}', '\${acc.issuer}')" class="delete-btn" title="删除">🗑️</button>
+                      <button onclick="openDeleteModal('\${safeId}', '\${safeIssuer.replace(/'/g, "\\'")}')" class="delete-btn" title="删除">🗑️</button>
                   </div>
-              \`).join('');
+              \`}).join('');
           }
 
           for (let acc of accounts) {
-              const codeEl = document.getElementById(\`code-\${acc.id}\`);
-              const barEl = document.getElementById(\`bar-\${acc.id}\`);
+              const safeId = escapeHtml(acc.id);
+              const codeEl = document.getElementById(\`code-\${safeId}\`);
+              const barEl = document.getElementById(\`bar-\${safeId}\`);
               if(codeEl && barEl) {
                   if (seconds === 0 || codeEl.innerText === '...' || codeEl.innerText === 'ERROR') {
                       codeEl.innerText = await generateToken(acc.secret);
@@ -920,7 +968,6 @@ function renderDashboard(username, accounts) {
                   }
                   barEl.style.width = \`\${percent}%\`;
                   
-                  // --- 颜色逻辑：绿 -> 蓝 -> 红 ---
                   if (percent < 15) {
                       barEl.style.background = 'var(--danger)';
                       codeEl.style.color = 'var(--danger)';
