@@ -4,7 +4,7 @@ const SESSION_COOKIE_NAME = 'web_auth_session';
 const MAX_BACKUPS = 20; 
 
 // --- PWA 配置 ---
-const PWA_VERSION = 'v1.1.0'; // 版本升级，强制更新缓存策略
+const PWA_VERSION = 'v1.1.2'; // 版本升级，配合登录页清理逻辑确保更新
 
 // --- 安全工具函数 (后端用) ---
 function escapeHtml(unsafe) {
@@ -37,13 +37,12 @@ export default {
       return new Response(renderSetupPage(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
-    // 2. 鉴权 (多设备支持)
+    // 2. 鉴权 (多设备 Session 支持)
     const cookieStr = request.headers.get('Cookie') || '';
     const tokenMatch = cookieStr.match(new RegExp('(^| )' + SESSION_COOKIE_NAME + '=([^;]+)'));
     const currentToken = tokenMatch ? tokenMatch[2] : null;
 
     // 检查 Token 是否存在于 sessions 数组中
-    // 兼容逻辑：确保 sessions 是数组，且包含当前 token
     const isLoggedIn = currentToken && 
                        config.sessions && 
                        Array.isArray(config.sessions) && 
@@ -199,22 +198,31 @@ async function verifyTurnstileToken(secret, token, ip) {
     return outcome.success;
 }
 
-async function saveDataWithBackup(env, data) {
+// [核心保存函数]
+// needBackup: true (默认) = 触发历史备份
+// needBackup: false = 仅保存当前状态，不备份 (用于登录)
+async function saveDataWithBackup(env, data, needBackup = true) {
     const jsonString = JSON.stringify(data);
+    
+    // 1. 始终保存当前最新配置 (覆盖 auth_data.json)
     await env.DB.put(CONFIG_FILE, jsonString);
-    const timestamp = getBjTimeFilename(); 
-    const backupKey = `backups/${timestamp}_auto.json`;
-    await env.DB.put(backupKey, jsonString);
 
-    try {
-        const list = await env.DB.list({ prefix: 'backups/' });
-        const backups = list.objects;
-        if (backups.length > MAX_BACKUPS) {
-            const deleteCount = backups.length - MAX_BACKUPS;
-            const keysToDelete = backups.slice(0, deleteCount).map(obj => obj.key);
-            if (keysToDelete.length > 0) await env.DB.delete(keysToDelete);
-        }
-    } catch (e) { console.error("Backup cleanup failed", e); }
+    // 2. 根据开关决定是否创建历史备份
+    if (needBackup) {
+        const timestamp = getBjTimeFilename(); 
+        const backupKey = `backups/${timestamp}_auto.json`;
+        await env.DB.put(backupKey, jsonString);
+
+        try {
+            const list = await env.DB.list({ prefix: 'backups/' });
+            const backups = list.objects;
+            if (backups.length > MAX_BACKUPS) {
+                const deleteCount = backups.length - MAX_BACKUPS;
+                const keysToDelete = backups.slice(0, deleteCount).map(obj => obj.key);
+                if (keysToDelete.length > 0) await env.DB.delete(keysToDelete);
+            }
+        } catch (e) { console.error("Backup cleanup failed", e); }
+    }
 }
 
 function getBjTimeFilename() {
@@ -229,7 +237,7 @@ function getBjTimeFilename() {
 function logoutResponse() {
     return new Response('Logged out', {
         status: 302,
-        headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=; Max-Age=0; HttpOnly; Path=/; SameSite=Strict; Secure` }
+        headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax; Secure` }
     });
 }
 
@@ -244,7 +252,7 @@ async function handleSetup(request, env) {
   if (!username || !password) return new Response('Incomplete data', { status: 400 });
 
   const hashedPassword = await hashPassword(password);
-  // [修改] 初始化 sessions 数组
+  // [修改] 初始化 Sessions 数组
   const newConfig = { 
       username, 
       password: hashedPassword, 
@@ -252,6 +260,7 @@ async function handleSetup(request, env) {
       accounts: [], 
       security: { failedAttempts: 0, lockoutUntil: 0 } 
   };
+  // Setup 视为重要变更，执行备份 (默认 true)
   await saveDataWithBackup(env, newConfig);
   return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
@@ -260,12 +269,12 @@ async function handleLogin(request, env, config) {
   const siteKey = env.TURNSTILE_SITE_KEY;
   const secretKey = env.TURNSTILE_SECRET_KEY;
   
-  // [安全修复] Fail-Secure: 如果有 Site Key 但缺少 Secret Key，视为服务器配置错误
+  // [安全修复] Fail-Secure 配置检查
   if (siteKey && !secretKey) {
       return new Response('Server Configuration Error: Missing Turnstile Secret Key', { status: 500 });
   }
 
-  await new Promise(r => setTimeout(r, 2000)); // 防止爆破的硬延时
+  await new Promise(r => setTimeout(r, 2000)); // 基础防爆破延时
   
   const now = Date.now();
   if (config.security && config.security.lockoutUntil > now) {
@@ -278,7 +287,7 @@ async function handleLogin(request, env, config) {
   const inputPass = formData.get('password');
   const turnstileToken = formData.get('cf-turnstile-response');
 
-  // --- Turnstile 验证逻辑 ---
+  // --- Turnstile 验证 ---
   if (siteKey) {
       if (!turnstileToken) {
           return new Response(renderLoginPage(true, '请完成人机验证', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
@@ -299,7 +308,10 @@ async function handleLogin(request, env, config) {
       if (!config.security) config.security = { failedAttempts: 0, lockoutUntil: 0 };
       config.security.failedAttempts += 1;
       if (config.security.failedAttempts >= 5) config.security.lockoutUntil = Date.now() + 15 * 60 * 1000;
-      await saveDataWithBackup(env, config);
+      
+      // [智能备份] 登录失败不触发备份 (false)
+      await saveDataWithBackup(env, config, false);
+      
       return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
@@ -323,11 +335,12 @@ async function handleLogin(request, env, config) {
   // 清理旧版数据
   if (config.sessionToken) delete config.sessionToken;
 
-  await saveDataWithBackup(env, config);
+  // [智能备份] 登录成功不触发备份 (false)
+  await saveDataWithBackup(env, config, false);
 
   return new Response(null, {
     status: 302,
-    headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=${newToken}; HttpOnly; Path=/; SameSite=Strict; Secure; Max-Age=2592000` } // 30天有效
+    headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=${newToken}; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=2592000` } // 30天
   });
 }
 
@@ -355,7 +368,10 @@ async function handleAddAccount(request, env, config) {
     const newAccount = { id: crypto.randomUUID(), issuer, secret, addedAt: Date.now() };
     if (!config.accounts) config.accounts = [];
     config.accounts.push(newAccount);
+    
+    // 添加账户：自动备份 (默认 true)
     await saveDataWithBackup(env, config);
+    
     return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
 
@@ -364,6 +380,7 @@ async function handleDeleteAccount(request, env, config) {
     const id = formData.get('id');
     if (config.accounts) {
         config.accounts = config.accounts.filter(acc => acc.id !== id);
+        // 删除账户：自动备份 (默认 true)
         await saveDataWithBackup(env, config);
     }
     return new Response(null, { status: 302, headers: { 'Location': '/' } });
@@ -409,7 +426,9 @@ async function handleRestore(request, env) {
         // [修改] 恢复时也确保 sessions 结构正确
         if (!json.sessions) json.sessions = [];
         
+        // 恢复数据：自动备份 (默认 true)
         await saveDataWithBackup(env, json);
+        
         return logoutResponse();
     } catch (e) {
         return new Response('Restore failed: ' + e.message, { status: 500 });
@@ -564,6 +583,20 @@ function renderLoginPage(isError, msg, siteKey) {
 
   return `<!DOCTYPE html><html><head><title>登录 - Cloud Auth</title>${commonHead}
   ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
+  <script>
+    // [安全清理] 每次进入登录页，自动清理所有本地缓存和 Storage
+    (async function clearLocalData() {
+        try {
+            if ('caches' in window) {
+                const keys = await caches.keys();
+                await Promise.all(keys.map(key => caches.delete(key)));
+            }
+            localStorage.clear();
+            sessionStorage.clear();
+            // [修复] 删除强制卸载 Service Worker 的逻辑，保留 PWA 能力
+        } catch (e) { console.log('Cleanup error', e); }
+    })();
+  </script>
   <style>
     body { align-items: center; background: var(--bg); }
     .login-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; }
