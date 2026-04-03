@@ -1,18 +1,25 @@
-/**
- * Cloud Auth - Ultimate Edition
- * Platform: Cloudflare Workers + R2
- * Version: v2.5.0 (Full UI Polish + Modal Confirmations + Smart Backup)
- */
-
-// --- 全局配置 ---
+// --- 配置区 ---
 const SESSION_COOKIE_NAME = 'web_auth_session';
-const MAX_BACKUPS = 10; // 每个用户保留的自动备份数量
-const PWA_VERSION = 'v2.5.0'; // 版本号更新
+const MAX_BACKUPS = 20; 
 
-// 存储前缀
-const PREFIX_USER = 'usr/'; // 用户档案
+// --- PWA 配置 ---
+const PWA_VERSION = 'v1.1.2'; // 版本升级，配合登录页清理逻辑确保更新
+
+// --- 多用户存储前缀 ---
+const PREFIX_USER = 'usr/'; // 用户档案 (密码、密保等)
 const PREFIX_DATA = 'dat/'; // 2FA 数据
 const PREFIX_SESS = 'sess/'; // 会话
+
+// --- 安全工具函数 (后端用) ---
+function escapeHtml(unsafe) {
+    if (!unsafe) return "";
+    return String(unsafe)
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
 
 export default {
   async fetch(request, env) {
@@ -21,17 +28,17 @@ export default {
 
     // 检查 R2 绑定
     if (!env.DB || typeof env.DB.put !== 'function') {
-        return new Response('Configuration Error: Please bind an R2 Bucket to the variable "DB".', { status: 500 });
+        return new Response('Configuration Error: Please bind an R2 Bucket to "DB".', { status: 500 });
     }
 
-    // --- PWA 静态资源 ---
+    // --- PWA 静态资源路由 ---
     if (path === '/manifest.json') return handleManifest();
     if (path === '/sw.js') return handleServiceWorker();
     if (path === '/app-icon.svg') return handleAppIcon();
 
     const siteKey = env.TURNSTILE_SITE_KEY || null;
 
-    // --- 公开路由 ---
+    // --- 公开路由 (登录、注册、找回密码) ---
     if (path === '/login') {
         if (request.method === 'POST') return await handleLogin(request, env);
         return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
@@ -51,22 +58,25 @@ export default {
     // --- 鉴权拦截 ---
     const user = await getCurrentUser(request, env);
     if (!user) {
+        if (path === '/') return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
         return new Response(null, { status: 302, headers: { 'Location': '/login' } });
     }
 
-    // --- 受保护路由 ---
+    // --- 登录后功能 ---
     if (path === '/') return await handleDashboard(env, user);
     if (path === '/add' && request.method === 'POST') return await handleAddAccount(request, env, user);
     if (path === '/delete' && request.method === 'POST') return await handleDeleteAccount(request, env, user);
+    
+    // 备份与恢复
     if (path === '/backup') return await handleDownloadBackup(request, env, user);
     if (path === '/backups/list') return await handleListBackups(env, user);
     if (path === '/restore' && request.method === 'POST') return await handleRestore(request, env, user);
 
-    return new Response(null, { status: 302, headers: { 'Location': '/' } });
+    return new Response('Not Found', { status: 404 });
   }
 };
 
-// --- R2 存储封装 ---
+// --- R2 多用户存储封装 ---
 
 async function r2Get(env, key) {
     const obj = await env.DB.get(key);
@@ -86,7 +96,7 @@ async function r2Delete(env, key) {
 
 // Session 管理
 async function setSession(env, token, username) {
-    const data = { u: username, exp: Date.now() + 86400 * 7 * 1000 };
+    const data = { u: username, exp: Date.now() + 2592000 * 1000 }; // 30天
     await r2Put(env, PREFIX_SESS + token, data);
 }
 
@@ -100,8 +110,95 @@ async function getSessionUser(env, token) {
     return data.u;
 }
 
-// --- 安全工具 ---
+// --- PWA 处理函数 ---
 
+function handleManifest() {
+    const manifest = {
+        name: "Cloud Authenticator",
+        short_name: "Auth",
+        start_url: "/",
+        display: "standalone",
+        background_color: "#f3f4f6",
+        theme_color: "#2563eb",
+        description: "Secure Cloudflare Worker Authenticator",
+        icons: [
+            { src: "/app-icon.svg", sizes: "192x192", type: "image/svg+xml", purpose: "any maskable" },
+            { src: "/app-icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }
+        ]
+    };
+    return new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/manifest+json' } });
+}
+
+function handleAppIcon() {
+    const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="background:#2563eb;border-radius:20%">
+      <rect width="512" height="512" fill="#2563eb"/>
+      <path d="M256 48C150 48 64 134 64 240c0 88 57 163 136 186v-56c-49-20-80-69-80-125 0-75 61-136 136-136s136 61 136 136c0 56-31 105-80 125v56c79-23 136-98 136-186C448 134 362 48 256 48z" fill="#fff"/>
+      <path d="M256 208c-35.3 0-64 28.7-64 64 0 21.6 10.9 40.4 27.2 52L200 384h112l-19.2-60c16.3-11.6 27.2-30.4 27.2-52 0-35.3-28.7-64-64-64z" fill="#fff"/>
+    </svg>`.trim();
+    return new Response(svg, { headers: { 'Content-Type': 'image/svg+xml' } });
+}
+
+function handleServiceWorker() {
+    const js = `
+    const CACHE_NAME = 'auth-cache-${PWA_VERSION}';
+    // [安全修复] 只缓存静态资源，绝对不缓存HTML页面（包含敏感数据）
+    const URLS_TO_CACHE = [
+        '/app-icon.svg',
+        'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'
+    ];
+
+    self.addEventListener('install', event => {
+        event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(URLS_TO_CACHE)));
+        self.skipWaiting();
+    });
+
+    self.addEventListener('activate', event => {
+        event.waitUntil(
+            caches.keys().then(cacheNames => {
+                return Promise.all(
+                    cacheNames.map(cacheName => {
+                        if (cacheName !== CACHE_NAME) return caches.delete(cacheName);
+                    })
+                );
+            })
+        );
+        self.clients.claim();
+    });
+
+    self.addEventListener('fetch', event => {
+        if (event.request.method !== 'GET') return;
+        
+        const url = new URL(event.request.url);
+        
+        // [安全修复] 明确排除根路径和任何非静态资源
+        if (url.pathname === '/' || url.pathname.startsWith('/api') || url.pathname === '/login' || url.pathname === '/register') {
+             return; 
+        }
+
+        event.respondWith(
+            caches.match(event.request)
+                .then(response => {
+                    if (response) return response;
+                    return fetch(event.request).then(response => {
+                         // 只缓存特定的静态资源类型
+                         if (!response || response.status !== 200 || response.type !== 'basic') return response;
+                         // 二次检查：确保不缓存 HTML
+                         const contentType = response.headers.get('content-type');
+                         if (contentType && contentType.includes('text/html')) return response;
+                         
+                         const responseToCache = response.clone();
+                         caches.open(CACHE_NAME).then(cache => cache.put(event.request, responseToCache));
+                         return response;
+                    });
+                })
+        );
+    });
+    `;
+    return new Response(js, { headers: { 'Content-Type': 'application/javascript' } });
+}
+
+// --- 安全核心工具 ---
 async function hashPassword(password, salt = null) {
     const encoder = new TextEncoder();
     if (!salt) {
@@ -110,6 +207,7 @@ async function hashPassword(password, salt = null) {
         salt = [...saltBytes].map(b => b.toString(16).padStart(2, '0')).join('');
     }
     const data = encoder.encode(password + salt);
+    // 维持 SHA-256 兼容性
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return `${salt}$${hashArray.map(b => b.toString(16).padStart(2, '0')).join('')}`;
@@ -117,20 +215,26 @@ async function hashPassword(password, salt = null) {
 
 async function verifyPassword(input, stored) {
     if (!stored) return false;
+    if (!stored.includes('$')) return input === stored ? 'LEGACY_MATCH' : false;
     const [salt, hash] = stored.split('$');
     const newHash = await hashPassword(input, salt);
     return newHash.split('$')[1] === hash;
 }
 
-async function verifyTurnstile(env, token, ip) {
-    if (!env.TURNSTILE_SECRET_KEY || !env.TURNSTILE_SITE_KEY) return true;
+// --- Turnstile 验证工具 ---
+async function verifyTurnstileToken(secret, token, ip) {
+    if (!secret) return true;
     if (!token) return false;
     const formData = new FormData();
-    formData.append('secret', env.TURNSTILE_SECRET_KEY);
+    formData.append('secret', secret);
     formData.append('response', token);
     formData.append('remoteip', ip);
+
     try {
-        const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { body: formData, method: 'POST' });
+        const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            body: formData,
+            method: 'POST',
+        });
         const outcome = await result.json();
         return outcome.success;
     } catch (e) { return false; }
@@ -145,34 +249,32 @@ async function getCurrentUser(request, env) {
     return await getSessionUser(env, token);
 }
 
-// --- 数据业务逻辑 ---
+// --- 业务逻辑 (多用户数据操作) ---
+
+function jsonResponse(data) {
+    return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } });
+}
 
 async function getUserData(env, username) {
     const data = await r2Get(env, PREFIX_DATA + username);
     return data || { accounts: [] };
 }
 
-// 智能备份保存：enableBackup 为 true 时才生成历史版本
-async function saveUserData(env, username, data, enableBackup = false) {
-    // 1. 始终保存最新数据
+async function saveUserDataWithBackup(env, username, data, needBackup = true) {
     await r2Put(env, PREFIX_DATA + username, data);
-    
-    // 2. 仅在需要时生成历史备份
-    if (enableBackup) {
+
+    if (needBackup) {
         const timestamp = getBjTimeFilename(); 
         const backupKey = `backups/${username}/${timestamp}_auto.json`;
         await r2Put(env, backupKey, data);
 
-        // 清理旧备份
         try {
             const list = await env.DB.list({ prefix: `backups/${username}/` });
-            if (list.objects && list.objects.length > MAX_BACKUPS) {
-                const sorted = list.objects.sort((a, b) => a.key.localeCompare(b.key));
-                const deleteCount = sorted.length - MAX_BACKUPS;
-                if (deleteCount > 0) {
-                    const keysToDelete = sorted.slice(0, deleteCount).map(obj => obj.key);
-                    await env.DB.delete(keysToDelete);
-                }
+            const backups = list.objects.sort((a, b) => a.key.localeCompare(b.key));
+            if (backups.length > MAX_BACKUPS) {
+                const deleteCount = backups.length - MAX_BACKUPS;
+                const keysToDelete = backups.slice(0, deleteCount).map(obj => obj.key);
+                if (keysToDelete.length > 0) await env.DB.delete(keysToDelete);
             }
         } catch (e) { console.error("Backup cleanup failed", e); }
     }
@@ -181,10 +283,11 @@ async function saveUserData(env, username, data, enableBackup = false) {
 function getBjTimeFilename() {
     const now = new Date();
     const bjTime = new Date(now.getTime() + 28800000);
-    return bjTime.toISOString().replace(/\..+/, '').replace('T', '_').replace(/:/g, '-');
+    const iso = bjTime.toISOString(); 
+    return iso.replace(/\..+/, '').replace('T', '_').replace(/:/g, '-');
 }
 
-// --- 路由处理函数 ---
+// --- 路由功能处理 ---
 
 async function handleRegister(request, env) {
     const formData = await request.formData();
@@ -196,7 +299,7 @@ async function handleRegister(request, env) {
 
     if (!username || !password || !question || !answer) return new Response('信息不完整', { status: 400 });
 
-    if (!(await verifyTurnstile(env, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
+    if (!(await verifyTurnstileToken(env.TURNSTILE_SECRET_KEY, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
         return new Response(renderRegisterPage(true, '人机验证失败', env.TURNSTILE_SITE_KEY), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
     }
 
@@ -208,7 +311,7 @@ async function handleRegister(request, env) {
     const userProfile = {
         username,
         password: await hashPassword(password),
-        security: { question: question, answer: await hashPassword(answer) }, // 存储自定义问题
+        security: { question: question, answer: await hashPassword(answer), failedAttempts: 0, lockoutUntil: 0 },
         created_at: Date.now()
     };
 
@@ -219,34 +322,62 @@ async function handleRegister(request, env) {
 }
 
 async function handleLogin(request, env) {
-    const formData = await request.formData();
-    const username = formData.get('username').trim().toLowerCase();
-    const password = formData.get('password');
-    const turnstileToken = formData.get('cf-turnstile-response');
-    const siteKey = env.TURNSTILE_SITE_KEY;
+  const siteKey = env.TURNSTILE_SITE_KEY;
+  const secretKey = env.TURNSTILE_SECRET_KEY;
+  
+  // [安全修复] Fail-Secure 配置检查
+  if (siteKey && !secretKey) {
+      return new Response('Server Configuration Error: Missing Turnstile Secret Key', { status: 500 });
+  }
 
-    if (!username || !password) return new Response(renderLoginPage(true, '请输入账号和密码', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+  await new Promise(r => setTimeout(r, 2000)); // 基础防爆破延时
 
-    if (!(await verifyTurnstile(env, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
-        return new Response(renderLoginPage(true, '人机验证失败', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
-    }
+  const formData = await request.formData();
+  const inputUser = formData.get('username').trim().toLowerCase();
+  const inputPass = formData.get('password');
+  const turnstileToken = formData.get('cf-turnstile-response');
 
-    const userProfile = await r2Get(env, PREFIX_USER + username);
-    if (!userProfile) return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+  const userProfile = await r2Get(env, PREFIX_USER + inputUser);
+  
+  if (userProfile && userProfile.security && userProfile.security.lockoutUntil > Date.now()) {
+      const waitMin = Math.ceil((userProfile.security.lockoutUntil - Date.now()) / 60000);
+      return new Response(renderLoginPage(true, `已锁定，请 ${waitMin} 分钟后再试`, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  }
 
-    const isMatch = await verifyPassword(password, userProfile.password);
-    if (!isMatch) return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+  // --- Turnstile 验证 ---
+  if (siteKey) {
+      if (!turnstileToken) return new Response(renderLoginPage(true, '请完成人机验证', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      const ip = request.headers.get('CF-Connecting-IP');
+      const isVerified = await verifyTurnstileToken(secretKey, turnstileToken, ip);
+      if (!isVerified) return new Response(renderLoginPage(true, '人机验证失败，请重试', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  }
 
-    const sessionToken = crypto.randomUUID();
-    await setSession(env, sessionToken, username);
+  if (!userProfile) {
+      return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  }
 
-    return new Response(null, {
-        status: 302,
-        headers: { 
-            'Location': '/', 
-            'Set-Cookie': `${SESSION_COOKIE_NAME}=${sessionToken}; HttpOnly; Path=/; SameSite=Strict; Secure; Max-Age=604800` 
-        }
-    });
+  const passMatchResult = await verifyPassword(inputPass, userProfile.password);
+
+  if (passMatchResult === false) {
+      if (!userProfile.security) userProfile.security = { failedAttempts: 0, lockoutUntil: 0 };
+      userProfile.security.failedAttempts += 1;
+      if (userProfile.security.failedAttempts >= 5) userProfile.security.lockoutUntil = Date.now() + 15 * 60 * 1000;
+      await r2Put(env, PREFIX_USER + inputUser, userProfile);
+      
+      return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  }
+
+  if (passMatchResult === 'LEGACY_MATCH') userProfile.password = await hashPassword(inputPass);
+  if (userProfile.security) { userProfile.security.failedAttempts = 0; userProfile.security.lockoutUntil = 0; }
+  await r2Put(env, PREFIX_USER + inputUser, userProfile);
+  
+  const newToken = crypto.randomUUID();
+  await setSession(env, newToken, inputUser);
+
+  return new Response(null, {
+    status: 302,
+    headers: { 'Location': '/', 'Set-Cookie': `${SESSION_COOKIE_NAME}=${newToken}; HttpOnly; Path=/; SameSite=Lax; Secure; Max-Age=2592000` } // 30天
+  });
 }
 
 async function handleForgotPassword(request, env) {
@@ -258,14 +389,14 @@ async function handleForgotPassword(request, env) {
 
     if (step === '1') {
         const userProfile = await r2Get(env, PREFIX_USER + username);
-        if (!userProfile) return new Response(renderForgotPage(env, '1', '', '用户不存在', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
-        if (!userProfile.security) return new Response(renderForgotPage(env, '1', '', '该账号未设置安全问题', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+        if (!userProfile) return new Response(await renderForgotPage(env, '1', '', '用户不存在', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+        if (!userProfile.security || !userProfile.security.question) return new Response(await renderForgotPage(env, '1', '', '该账号未设置安全问题', siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
         
-        return renderForgotPage(env, '2', username, null, siteKey, userProfile.security.question);
+        return await renderForgotPage(env, '2', username, null, siteKey, userProfile.security.question);
     } 
     
     if (step === '2') {
-        if (!(await verifyTurnstile(env, turnstileToken, request.headers.get('CF-Connecting-IP')))) return new Response('人机验证失败', {status: 400});
+        if (!(await verifyTurnstileToken(env.TURNSTILE_SECRET_KEY, turnstileToken, request.headers.get('CF-Connecting-IP')))) return new Response('人机验证失败', {status: 400});
 
         const answer = formData.get('answer');
         const newPassword = formData.get('new_password');
@@ -274,10 +405,12 @@ async function handleForgotPassword(request, env) {
         if (!userProfile) return new Response('Error', {status: 400});
         
         if (!(await verifyPassword(answer, userProfile.security.answer))) {
-             return renderForgotPage(env, '2', username, '密保答案错误', siteKey, userProfile.security.question);
+             return await renderForgotPage(env, '2', username, '密保答案错误', siteKey, userProfile.security.question);
         }
 
         userProfile.password = await hashPassword(newPassword);
+        userProfile.security.failedAttempts = 0;
+        userProfile.security.lockoutUntil = 0;
         await r2Put(env, PREFIX_USER + username, userProfile);
 
         return new Response(null, { status: 302, headers: { 'Location': '/login?reset=1' } });
@@ -292,28 +425,41 @@ async function handleLogout(request, env) {
     }
     return new Response('Logged out', {
         status: 302,
-        headers: { 'Location': '/login', 'Set-Cookie': `${SESSION_COOKIE_NAME}=; Max-Age=0; HttpOnly; Path=/; SameSite=Strict; Secure` }
+        headers: { 'Location': '/login', 'Set-Cookie': `${SESSION_COOKIE_NAME}=; Max-Age=0; HttpOnly; Path=/; SameSite=Lax; Secure` }
     });
 }
 
-// --- 账户操作与备份策略 ---
-
 async function handleDashboard(env, username) {
-    const data = await getUserData(env, username);
-    return new Response(renderDashboard(username, data.accounts), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+  const data = await getUserData(env, username);
+  return new Response(renderDashboard(username, data.accounts), { 
+      headers: { 
+          'Content-Type': 'text/html;charset=UTF-8',
+          // [安全增强] 添加基础安全头
+          'X-Frame-Options': 'DENY',
+          'X-Content-Type-Options': 'nosniff'
+      } 
+  });
 }
 
 async function handleAddAccount(request, env, username) {
     const formData = await request.formData();
     let issuer = formData.get('issuer') || 'Unknown';
     let secret = formData.get('secret') || '';
+    
+    // [安全修复] 输入长度限制
+    if (issuer.length > 64) issuer = issuer.substring(0, 64);
+    if (secret.length > 256) return new Response('Secret too long', { status: 400 });
+    
     secret = secret.replace(/\s+/g, '').toUpperCase().replace(/=+$/, ''); 
+    const newAccount = { id: crypto.randomUUID(), issuer, secret, addedAt: Date.now() };
     
     const data = await getUserData(env, username);
-    data.accounts.push({ id: crypto.randomUUID(), issuer, secret, addedAt: Date.now() });
+    if (!data.accounts) data.accounts = [];
+    data.accounts.push(newAccount);
     
-    // 添加时触发备份: true
-    await saveUserData(env, username, data, true);
+    // 添加账户：自动备份 (默认 true)
+    await saveUserDataWithBackup(env, username, data);
+    
     return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
 
@@ -321,38 +467,41 @@ async function handleDeleteAccount(request, env, username) {
     const formData = await request.formData();
     const id = formData.get('id');
     const data = await getUserData(env, username);
-    data.accounts = data.accounts.filter(acc => acc.id !== id);
     
-    // 删除时触发备份: true
-    await saveUserData(env, username, data, true);
+    if (data.accounts) {
+        data.accounts = data.accounts.filter(acc => acc.id !== id);
+        // 删除账户：自动备份 (默认 true)
+        await saveUserDataWithBackup(env, username, data);
+    }
     return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
 
 async function handleDownloadBackup(request, env, username) {
     const url = new URL(request.url);
-    const targetKey = url.searchParams.get('file');
-    let dbKey, fileName;
+    const targetFile = url.searchParams.get('file');
     
-    if (targetKey) {
-        if (!targetKey.startsWith(`backups/${username}/`)) return new Response("Access Denied", { status: 403 });
-        dbKey = targetKey;
-        fileName = targetKey.split('/').pop().replace('.json', '');
+    let dbKey, downloadName;
+    if (targetFile) {
+        if (!targetFile.startsWith(`backups/${username}/`)) return new Response("Access Denied", { status: 403 });
+        dbKey = targetFile;
+        downloadName = targetFile.replace(`backups/${username}/`, '').replace('/', '_');
     } else {
         dbKey = PREFIX_DATA + username;
-        fileName = `auth_backup_${username}_${getBjTimeFilename()}`;
+        downloadName = `auth_backup_${username}_${getBjTimeFilename()}.json`;
     }
 
     const object = await env.DB.get(dbKey);
     if (!object) return new Response("File not found", { status: 404 });
-    return new Response(object.body, { 
-        headers: { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="${fileName}.json"` } 
-    });
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    headers.set('Content-Disposition', `attachment; filename="${downloadName}"`);
+    return new Response(object.body, { headers });
 }
 
 async function handleListBackups(env, username) {
     const list = await env.DB.list({ prefix: `backups/${username}/` });
     const files = list.objects.reverse().map(obj => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded }));
-    return new Response(JSON.stringify(files), { headers: { 'Content-Type': 'application/json' } });
+    return jsonResponse(files);
 }
 
 async function handleRestore(request, env, username) {
@@ -366,597 +515,695 @@ async function handleRestore(request, env, username) {
             json = JSON.parse(await file.text());
         } else if (r2Key) {
             if (!r2Key.startsWith(`backups/${username}/`)) throw new Error("Access Denied");
-            json = await r2Get(env, r2Key);
-            if (!json) throw new Error("Backup not found");
-        } else { throw new Error("Invalid request"); }
+            const obj = await env.DB.get(r2Key);
+            if (!obj) throw new Error("Backup not found");
+            json = await obj.json();
+        } else {
+            throw new Error("Invalid request");
+        }
 
-        if (!json.accounts || !Array.isArray(json.accounts)) throw new Error("格式错误: 找不到 accounts 数组");
+        if (!json.accounts) throw new Error("Format Error");
         
-        // 恢复时触发备份: true
-        await saveUserData(env, username, json, true);
+        // 恢复数据：自动备份 (默认 true)
+        await saveUserDataWithBackup(env, username, json);
+        
         return new Response(null, { status: 302, headers: { 'Location': '/' } });
     } catch (e) {
         return new Response('Restore failed: ' + e.message, { status: 500 });
     }
 }
 
-// --- PWA 处理 ---
-
-function handleManifest() {
-    const manifest = {
-        name: "Cloud Authenticator",
-        short_name: "Auth",
-        start_url: "/",
-        display: "standalone",
-        background_color: "#f8fafc",
-        theme_color: "#4f46e5",
-        icons: [{ src: "/app-icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }]
-    };
-    return new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/manifest+json' } });
-}
-
-function handleAppIcon() {
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="background:#4f46e5;border-radius:30%"><rect width="512" height="512" fill="#4f46e5"/><path d="M256 48C150 48 64 134 64 240c0 88 57 163 136 186v-56c-49-20-80-69-80-125 0-75 61-136 136-136s136 61 136 136c0 56-31 105-80 125v56c79-23 136-98 136-186C448 134 362 48 256 48z" fill="#fff"/><path d="M256 208c-35.3 0-64 28.7-64 64 0 21.6 10.9 40.4 27.2 52L200 384h112l-19.2-60c16.3-11.6 27.2-30.4 27.2-52 0-35.3-28.7-64-64-64z" fill="#fff"/></svg>`;
-    return new Response(svg, { headers: { 'Content-Type': 'image/svg+xml' } });
-}
-
-function handleServiceWorker() {
-    const js = `
-    const CACHE_NAME = 'auth-ui-${PWA_VERSION}';
-    const URLS = ['/', '/app-icon.svg', '/login', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'];
-    self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(URLS))); self.skipWaiting(); });
-    self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.map(k => k !== CACHE_NAME && caches.delete(k))))); self.clients.claim(); });
-    self.addEventListener('fetch', e => { if(e.request.method!=='GET')return; e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))); });
-    `;
-    return new Response(js, { headers: { 'Content-Type': 'application/javascript' } });
-}
-
-// --- UI 渲染 (Modern & Beautiful) ---
+// --- 前端 UI (全部采用 workers.js 的样式和结构) ---
 
 const commonHead = `
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<link rel="manifest" href="/manifest.json"><link rel="icon" href="/app-icon.svg" type="image/svg+xml">
-<meta name="theme-color" content="#4f46e5">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/app-icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Auth">
+<link rel="apple-touch-icon" href="/app-icon.svg">
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');</script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW setup failed', err));
+  }
+  // [安全修复] 前端 HTML 转义工具
+  function escapeHtml(unsafe) {
+    if (!unsafe) return "";
+    return String(unsafe)
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+  }
+</script>
 <style>
   :root {
-    --bg-grad: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-    --card-bg: rgba(255, 255, 255, 0.9);
-    --text-main: #1e293b; --text-sub: #64748b;
-    --primary: #4f46e5; --primary-hover: #4338ca; --primary-light: #e0e7ff;
-    --danger: #ef4444; --success: #10b981; --border: #e2e8f0;
-    --shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1);
-    --radius-card: 28px;
-    --radius-pill: 50px;
-    --radius-input: 20px;
+    --bg: #f3f4f6; --card-bg: #ffffff; --text-main: #111827; --text-sub: #6b7280;
+    --primary: #2563eb; --primary-hover: #1d4ed8; --danger: #ef4444; --danger-bg: #fee2e2; --border: #e5e7eb;
+    --input-bg: #ffffff; --shadow: 0 4px 6px -1px rgba(0,0,0,0.1); --code-color: #2563eb;
+    --bar-bg: #e5e7eb; --modal-overlay: rgba(0,0,0,0.5); --list-hover: #f9fafb;
+    --icon-btn-hover: #e5e7eb;
   }
   [data-theme="dark"] {
-    --bg-grad: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-    --card-bg: rgba(30, 41, 59, 0.95);
-    --text-main: #f8fafc; --text-sub: #94a3b8;
-    --primary: #6366f1; --primary-hover: #4f46e5; --primary-light: #1e1b4b;
-    --danger: #f87171; --success: #34d399; --border: #334155;
-    --shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+    --bg: #111827; --card-bg: #1f2937; --text-main: #f9fafb; --text-sub: #9ca3af;
+    --primary: #3b82f6; --primary-hover: #60a5fa; --danger: #f87171; --danger-bg: #450a0a; --border: #374151;
+    --input-bg: #111827; --shadow: 0 4px 6px -1px rgba(0,0,0,0.3); --code-color: #60a5fa;
+    --bar-bg: #374151; --modal-overlay: rgba(0,0,0,0.7); --list-hover: #374151;
+    --icon-btn-hover: #374151;
   }
-  * { box-sizing: border-box; transition: background-color 0.2s, border-color 0.2s, color 0.2s; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-grad); color: var(--text-main); margin: 0; padding: 20px; min-height: 100vh; display:flex; justify-content:center; align-items:center; }
+  body { font-family: -apple-system, sans-serif; background-color: var(--bg); color: var(--text-main); margin: 0; padding: 20px 15px; display: flex; justify-content: center; transition: background-color 0.3s, color 0.3s; min-height: 100vh; box-sizing: border-box;}
+  .container { width: 100%; max-width: 440px; }
   
-  .container { width: 100%; max-width: 400px; animation: fadeUp 0.6s cubic-bezier(0.16, 1, 0.3, 1); }
-  
-  .card { 
-    background: var(--card-bg); 
-    border-radius: var(--radius-card); 
-    box-shadow: var(--shadow); 
-    padding: 40px 30px; 
-    border: 1px solid rgba(255,255,255,0.2); 
-    backdrop-filter: blur(12px);
-    position: relative; 
-    overflow: hidden; 
+  @supports (padding-top: env(safe-area-inset-top)) {
+    body { padding-top: calc(20px + env(safe-area-inset-top)); padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
   }
-  
-  h2 { margin: 0 0 8px 0; font-size: 1.6rem; font-weight: 700; color: var(--text-main); text-align: center; letter-spacing: -0.5px; }
-  p.subtitle { margin: 0 0 30px 0; text-align: center; color: var(--text-sub); font-size: 0.95rem; }
-  
-  .input-group { position: relative; margin-bottom: 20px; }
-  .input-icon { position: absolute; left: 18px; top: 50%; transform: translateY(-50%); color: var(--text-sub); pointer-events: none; z-index: 2; transition: color 0.2s; }
-  input, select { 
-    width: 100%; padding: 16px 16px 16px 50px; 
-    background: var(--primary-light); 
-    border: 2px solid transparent; 
-    border-radius: var(--radius-pill); 
-    color: var(--text-main); 
-    font-size: 1rem; 
-    outline: none; 
-    transition: all 0.2s; 
-    -webkit-appearance: none;
-  }
-  [data-theme="dark"] input { background: rgba(255,255,255,0.05); }
-  input:focus, select:focus { background: var(--card-bg); border-color: var(--primary); box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15); }
-  input:focus + .input-icon { color: var(--primary); }
-  
-  .btn { 
-    width: 100%; padding: 16px; 
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
-    color: white; border: none; 
-    border-radius: var(--radius-pill); 
-    font-weight: 600; cursor: pointer; 
-    font-size: 1.05rem; 
-    transition: transform 0.1s, box-shadow 0.2s; 
-    display: flex; justify-content: center; align-items: center; gap: 8px;
-    box-shadow: 0 10px 20px -5px rgba(79, 70, 229, 0.4);
-  }
-  .btn:active { transform: scale(0.97); }
-  .btn:hover { box-shadow: 0 15px 25px -5px rgba(79, 70, 229, 0.5); transform: translateY(-1px); }
-  
-  .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-main); box-shadow: none; }
-  .btn-outline:hover { background: rgba(0,0,0,0.03); transform: none; box-shadow: none; }
-  
-  .link { color: var(--primary); text-decoration: none; font-size: 0.9rem; cursor: pointer; font-weight: 500; padding: 5px; border-radius: 5px; }
-  .link:hover { background: var(--primary-light); }
-  .flex-between { display: flex; justify-content: space-between; align-items: center; margin-top: 25px; }
-  .text-center { text-align: center; }
-  
-  .err-msg { 
-    background: rgba(239, 68, 68, 0.1); color: var(--danger); 
-    padding: 14px; border-radius: var(--radius-input); 
-    margin-bottom: 20px; font-size: 0.9rem; display: flex; align-items: center; gap: 10px; 
-    border: 1px solid rgba(239, 68, 68, 0.1);
-  }
-  
-  .steps { display: flex; margin-bottom: 30px; position: relative; justify-content: center; gap: 60px; }
-  .step { width: 36px; height: 36px; border-radius: 50%; background: var(--border); color: var(--text-sub); display: flex; align-items: center; justify-content: center; font-weight: bold; z-index: 1; font-size: 0.9rem; position: relative; border: 3px solid var(--card-bg); }
-  .step.active { background: var(--primary); color: white; box-shadow: 0 0 0 4px var(--primary-light); }
-  .step.finished { background: var(--success); color: white; }
-  .step-line { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); width: 70px; height: 3px; background: var(--border); z-index: 0; }
-  
-  .success-anim { text-align: center; padding: 20px 0; }
-  .checkmark-circle { width: 80px; height: 80px; border-radius: 50%; background: var(--success); margin: 0 auto 25px; display: flex; align-items: center; justify-content: center; box-shadow: 0 10px 25px -5px rgba(16, 185, 129, 0.5); animation: popIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-  .checkmark { width: 40px; height: 40px; border-left: 5px solid white; border-bottom: 5px solid white; transform: rotate(-45deg) translate(2px, -4px); opacity: 0; animation: check 0.4s 0.4s forwards ease-out; }
 
-  @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-  @keyframes popIn { from { transform: scale(0); } to { transform: scale(1); } }
-  @keyframes check { from { opacity: 0; width: 0; height: 0; } to { opacity: 1; width: 40px; height: 20px; } }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 10px; }
+  .user-badge { font-size: 0.95rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 50%; display: flex; align-items: center; gap: 5px; color: var(--text-main); }
+  .header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+  .btn-icon { background: none; border: none; cursor: pointer; font-size: 1.2rem; padding: 8px; border-radius: 8px; color: var(--text-main); transition: background 0.2s; display: flex; align-items: center; justify-content: center; }
+  .btn-icon:hover { background: var(--icon-btn-hover); }
 
-  .auth-item { display: flex; justify-content: space-between; align-items: center; padding: 18px 0; border-bottom: 1px solid var(--border); }
+  .card { background: var(--card-bg); border-radius: 16px; box-shadow: var(--shadow); padding: 20px; margin-bottom: 15px; border: 1px solid var(--border); transition: background-color 0.3s, border-color 0.3s; }
+  .auth-item { display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px solid var(--border); }
   .auth-item:last-child { border-bottom: none; }
-  .auth-code { font-family: 'Courier New', Courier, monospace; font-size: 1.8rem; font-weight: 700; color: var(--primary); letter-spacing: 3px; }
+  .auth-info { flex: 1; overflow: hidden; } 
+  .auth-issuer { font-size: 0.85rem; color: var(--text-sub); font-weight: 500; margin-bottom: 4px; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .auth-code { font-family: monospace; font-size: 2rem; font-weight: 700; letter-spacing: 3px; color: var(--code-color); cursor: pointer; line-height: 1; display: inline-block; }
+  .auth-timer { height: 4px; background: var(--bar-bg); border-radius: 2px; margin-top: 8px; overflow: hidden; max-width: 60px;}
+  .auth-timer-bar { height: 100%; background: var(--primary); width: 100%; transition: width 1s linear; }
+  .delete-btn { background: none; border: none; color: var(--text-sub); font-size: 1.2rem; cursor: pointer; padding: 10px; opacity: 0.6; margin-left: 5px; transition: color 0.2s, opacity 0.2s; }
+  .delete-btn:hover { color: var(--danger); opacity: 1; }
+
+  h1, h2 { margin: 0 0 1rem 0; text-align: center; } h3 { margin: 0 0 10px 0; font-size: 1rem;}
+  input { width: 100%; padding: 12px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); box-sizing: border-box; margin-bottom: 12px; font-size: 1rem; outline: none; }
+  input:focus { border-color: var(--primary); }
+  .btn { width: 100%; padding: 12px; background: var(--primary); color: white; border: none; border-radius: 10px; font-weight: 600; cursor: pointer; font-size: 1rem; transition: background 0.2s;}
+  .btn:hover { background: var(--primary-hover); }
+  .btn-danger { background: var(--danger); color: white; }
+  .btn-danger:hover { opacity: 0.9; }
+  .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-main); cursor: pointer; border-radius: 8px; text-decoration: none; display: inline-block; text-align: center;}
+  .btn-outline:hover { background: var(--list-hover); }
+  .btn-sm { padding: 8px 12px; font-size: 0.9rem; width: auto; }
+  .btn-block { width: 100%; display: block; box-sizing: border-box;}
+
+  .backup-list { max-height: 300px; overflow-y: auto; margin-top: 10px; -webkit-overflow-scrolling: touch; }
+  .backup-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; border-bottom: 1px solid var(--border); text-decoration: none; color: var(--text-main); transition: background 0.2s; border-radius: 8px;}
+  .backup-item:hover { background: var(--list-hover); }
   
-  .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; padding: 20px; z-index: 100; backdrop-filter: blur(8px); opacity: 0; transition: opacity 0.3s; }
-  .modal.open { display: flex; opacity: 1; }
+  .restore-action-btn { background: var(--primary); color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; margin-left: 10px; }
+  
+  .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-20px); background: #10b981; color: white; padding: 10px 20px; border-radius: 50px; opacity: 0; pointer-events: none; transition: all 0.3s; z-index: 100; font-weight: 500; white-space: nowrap; box-shadow: 0 5px 15px rgba(0,0,0,0.2);}
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .fab { position: fixed; bottom: 30px; right: 30px; width: 56px; height: 56px; background: var(--primary); border-radius: 50%; display: flex; justify-content: center; align-items: center; color: white; font-size: 30px; box-shadow: 0 4px 15px rgba(37, 99, 235, 0.4); cursor: pointer; border: none; z-index: 90; -webkit-tap-highlight-color: transparent;}
+  .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--modal-overlay); align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; z-index: 99; backdrop-filter: blur(3px); opacity: 0; transition: opacity 0.2s;}
+  .modal.open { display: flex; opacity: 1;}
+  .icon-box-danger { width: 50px; height: 50px; border-radius: 50%; background: var(--danger-bg); color: var(--danger); display: flex; align-items: center; justify-content: center; font-size: 24px; margin: 0 auto 15px auto; }
+  
+  /* 扫描取景框样式 */
+  #scannerContainer { position: relative; overflow: hidden; border-radius: 10px; margin-bottom: 15px; background: #000; display: none; }
+  #qr-canvas { width: 100%; display: block; }
+  .scan-overlay { position: absolute; top:0; left:0; right:0; bottom:0; border: 2px solid rgba(255,255,255,0.5); box-sizing: border-box; }
+  
+  .text-center { text-align: center; } .text-sub { color: var(--text-sub); font-size: 0.9rem; } .mt-4 { margin-top: 1rem; } .flex-gap { display: flex; gap: 10px; } .hidden { display: none; }
+  .settings-section { margin-bottom: 20px; }
+  .settings-title { font-size: 0.9rem; font-weight: 600; color: var(--text-sub); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* 适配新的登录/注册样式 */
+  .auth-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; margin: auto;}
+  .brand-section { text-align: center; margin-bottom: 2rem; }
+  .brand-title { font-size: 1.5rem; font-weight: 700; color: var(--text-main); margin-top: 15px; letter-spacing: -0.5px; }
+  .brand-subtitle { font-size: 0.9rem; color: var(--text-sub); margin-top: 5px; }
+  .input-group { position: relative; margin-bottom: 1.2rem; }
+  .input-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--text-sub); pointer-events: none; z-index: 2; transition: color 0.2s; }
+  .input-field { padding-left: 48px !important; transition: all 0.2s; background: var(--input-bg); }
+  .input-field:focus + .input-icon { color: var(--primary); }
+  .toggle-password { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: var(--text-sub); padding: 8px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+  .toggle-password:hover { background: var(--list-hover); color: var(--text-main); }
+  .turnstile-container { display: flex; justify-content: center; margin-bottom: 15px; min-height: 65px; }
+  .btn.loading { position: relative; color: transparent; pointer-events: none; }
+  .btn.loading::after { content: ""; position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; margin-top: -10px; margin-left: -10px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 <script>
-  function initTheme(){document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));}
-  function toggleTheme(){const n=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('theme',n);}
+  function initTheme() {
+    const saved = localStorage.getItem('theme');
+    const system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', saved || system);
+    updateThemeIcon(saved || system);
+  }
+  function toggleTheme() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+    updateThemeIcon(next);
+  }
+  function updateThemeIcon(theme) { const icon = document.getElementById('theme-icon'); if(icon) icon.innerText = theme === 'dark' ? '🌙' : '☀️'; }
+  function showToast(msg) { const t = document.getElementById('toast'); t.innerText = msg; t.className = 'toast show'; setTimeout(() => t.className = 'toast', 2000); }
   initTheme();
 </script>
 `;
 
-const icons = {
-    user: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>',
-    lock: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>',
-    shield: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>',
-    key: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>',
-    edit: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>'
-};
+const appIconSvg = `
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width:64px;height:64px;border-radius:14px;box-shadow:0 8px 15px -3px rgba(37, 99, 235, 0.3);">
+  <rect width="512" height="512" fill="#2563eb"/>
+  <path d="M256 48C150 48 64 134 64 240c0 88 57 163 136 186v-56c-49-20-80-69-80-125 0-75 61-136 136-136s136 61 136 136c0 56-31 105-80 125v56c79-23 136-98 136-186C448 134 362 48 256 48z" fill="#fff"/>
+  <path d="M256 208c-35.3 0-64 28.7-64 64 0 21.6 10.9 40.4 27.2 52L200 384h112l-19.2-60c16.3-11.6 27.2-30.4 27.2-52 0-35.3-28.7-64-64-64z" fill="#fff"/>
+</svg>`;
+
+const userIconSvg = `<svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+const lockIconSvg = `<svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`;
+const keyIconSvg = `<svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>`;
+const editIconSvg = `<svg class="input-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`;
+const shieldIconSvg = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>`;
+
 
 function renderLoginPage(isError, msg, siteKey) {
-    return `<!DOCTYPE html><html><head><title>登录</title>${commonHead}
-    ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
-    </head><body>
-    <div class="container">
-        <div id="success-card" class="card text-center" style="display:none">
-            <div class="success-anim">
-                <div class="checkmark-circle"><div class="checkmark"></div></div>
-                <h2 id="success-title">操作成功</h2>
-                <p class="subtitle" id="success-msg">您的账户已准备就绪</p>
-                <button onclick="showLogin()" class="btn">立即登录</button>
-            </div>
-        </div>
-        <div id="login-card" class="card">
-            <div class="text-center" style="margin-bottom:30px;font-size:3.5rem;">🔒</div>
-            <h2>欢迎回来</h2>
-            <p class="subtitle">Cloud Authenticator 安全中心</p>
-            ${isError ? `<div class="err-msg"><span style="font-size:1.2em">⚠️</span> ${msg}</div>` : ''}
-            <form action="/login" method="POST">
-                <div class="input-group">
-                    <input type="text" name="username" placeholder="用户名 / 邮箱" required autocomplete="username">
-                    <span class="input-icon">${icons.user}</span>
-                </div>
-                <div class="input-group">
-                    <input type="password" name="password" placeholder="主密码" required autocomplete="current-password">
-                    <span class="input-icon">${icons.lock}</span>
-                </div>
-                ${siteKey ? `<div class="cf-turnstile" data-sitekey="${siteKey}" style="margin-bottom:20px;display:flex;justify-content:center"></div>` : ''}
-                <button type="submit" class="btn">登 录 <span style="font-size:1.2em">➔</span></button>
-            </form>
-            <div class="flex-between">
-                <a href="/register" class="link">注册新账户</a>
-                <a href="/forgot-password" class="link" style="color:var(--text-sub)">忘记密码?</a>
-            </div>
-        </div>
+  return `<!DOCTYPE html><html><head><title>登录 - Cloud Auth</title>${commonHead}
+  ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
+  <script>
+    (async function clearLocalData() {
+        try {
+            if ('caches' in window) {
+                const keys = await caches.keys();
+                await Promise.all(keys.map(key => caches.delete(key)));
+            }
+            localStorage.clear();
+            sessionStorage.clear();
+        } catch (e) { console.log('Cleanup error', e); }
+    })();
+  </script>
+  <style>body { align-items: center; background: var(--bg); }</style>
+  </head><body>
+    <div class="auth-container">
+      <div class="brand-section">${appIconSvg}<div class="brand-title">欢迎回来</div><div class="brand-subtitle">请验证您的身份以继续</div></div>
+      <div class="card" style="padding: 30px 25px;">
+        ${isError ? `<div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;"><span style="font-size:1.1rem">⚠️</span> ${msg || '用户名或密码错误'}</div>` : ''}
+        <form action="/login" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
+          <div class="input-group">
+            <input type="text" name="username" class="input-field" required placeholder="用户名" autocomplete="username">
+            ${userIconSvg}
+          </div>
+          <div class="input-group">
+            <input type="password" name="password" id="pwdInput" class="input-field" required placeholder="主密码" autocomplete="current-password">
+            ${lockIconSvg}
+            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1"><span id="eyeIcon">👁️</span></button>
+          </div>
+          ${siteKey ? `<div class="turnstile-container"><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="auto"></div></div>` : ''}
+          <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">立即登录</button>
+        </form>
+      </div>
+      
+      <div style="display:flex; justify-content:space-between; margin-top:20px; padding:0 10px;">
+          <a href="/register" style="color:var(--primary); text-decoration:none; font-size:0.9rem; font-weight:500;">注册新账号</a>
+          <a href="/forgot-password" style="color:var(--text-sub); text-decoration:none; font-size:0.9rem;">忘记密码?</a>
+      </div>
     </div>
     <script>
-        const params = new URLSearchParams(window.location.search);
-        const loginCard = document.getElementById('login-card');
-        const successCard = document.getElementById('success-card');
-        if(params.get('registered') || params.get('reset')) {
-            loginCard.style.display = 'none';
-            successCard.style.display = 'block';
-            if(params.get('registered')) {
-                document.getElementById('success-title').innerText = '注册成功';
-                document.getElementById('success-msg').innerText = '数据已隔离加密，请使用新账号登录';
-            } else {
-                document.getElementById('success-title').innerText = '重置成功';
-                document.getElementById('success-msg').innerText = '密码已更新，请使用新密码登录';
-            }
-        }
-        function showLogin() {
-            successCard.style.display = 'none';
-            loginCard.style.display = 'block';
-            loginCard.style.animation = 'fadeUp 0.5s';
-            window.history.replaceState({}, document.title, "/login");
-        }
+        function togglePwd() { const input = document.getElementById('pwdInput'); const icon = document.getElementById('eyeIcon'); if (input.type === 'password') { input.type = 'text'; icon.innerText = '🙈'; icon.style.opacity = '0.7'; } else { input.type = 'password'; icon.innerText = '👁️'; icon.style.opacity = '1'; } }
     </script>
-    </body></html>`;
+  </body></html>`;
 }
 
 function renderRegisterPage(isError, msg, siteKey) {
-    return `<!DOCTYPE html><html><head><title>注册</title>${commonHead}
-    ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
-    </head><body>
-    <div class="container">
-        <div class="card">
-            <h2>创建账户</h2>
-            <p class="subtitle">私有化部署 · R2 加密存储</p>
-            ${isError ? `<div class="err-msg">⚠️ ${msg}</div>` : ''}
-            <form action="/register" method="POST">
-                <div class="input-group">
-                    <input type="text" name="username" placeholder="设置用户名或邮箱" required pattern="[a-zA-Z0-9@._-]{3,50}" title="3-50位，允许字母、数字、@、.、_、-">
-                    <span class="input-icon">${icons.user}</span>
-                </div>
-                <div class="input-group">
-                    <input type="password" name="password" placeholder="设置登录密码 (至少6位)" required minlength="6">
-                    <span class="input-icon">${icons.lock}</span>
-                </div>
-                
-                <div style="background:var(--bg-grad); padding:20px; border-radius:var(--radius-input); margin-bottom:20px; border:1px solid rgba(0,0,0,0.05);">
-                    <div style="font-size:0.9rem; color:var(--text-sub); margin-bottom:15px; font-weight:600; display:flex; align-items:center; gap:8px;">
-                        ${icons.shield} 设置安全问题 (用于找回密码)
-                    </div>
-                    <div class="input-group" style="margin-bottom:15px">
-                        <input type="text" name="question" placeholder="自定义问题 (如: 我高中班主任的名字?)" required>
-                        <span class="input-icon">${icons.edit}</span>
-                    </div>
-                    <div class="input-group" style="margin-bottom:0">
-                        <input type="text" name="answer" placeholder="输入问题的答案" required>
-                        <span class="input-icon">${icons.key}</span>
-                    </div>
-                </div>
+  return `<!DOCTYPE html><html><head><title>注册 - Cloud Auth</title>${commonHead}
+  ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
+  <style>body { align-items: center; background: var(--bg); }</style>
+  </head><body>
+    <div class="auth-container">
+      <div class="brand-section">${appIconSvg}<div class="brand-title">创建账号</div><div class="brand-subtitle">私有化部署 · R2 加密存储</div></div>
+      <div class="card" style="padding: 30px 25px;">
+        ${isError ? `<div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;"><span style="font-size:1.1rem">⚠️</span> ${msg}</div>` : ''}
+        <form action="/register" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
+          <div class="input-group">
+            <input type="text" name="username" class="input-field" required placeholder="设置用户名" pattern="[a-zA-Z0-9@._-]{3,50}">
+            ${userIconSvg}
+          </div>
+          <div class="input-group">
+            <input type="password" name="password" id="pwdInput" class="input-field" required placeholder="设置登录密码 (至少6位)" minlength="6">
+            ${lockIconSvg}
+            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1"><span id="eyeIcon">👁️</span></button>
+          </div>
+          
+          <div style="background:var(--bg); padding:15px; border-radius:10px; margin-bottom:1.2rem; border:1px solid var(--border);">
+              <div style="font-size:0.85rem; color:var(--text-sub); margin-bottom:10px; font-weight:600; display:flex; align-items:center; gap:5px;">
+                  ${shieldIconSvg} 设置安全问题 (用于找回密码)
+              </div>
+              <div class="input-group" style="margin-bottom:10px;">
+                  <input type="text" name="question" class="input-field" required placeholder="自定义问题 (如: 班主任名字)">
+                  ${editIconSvg}
+              </div>
+              <div class="input-group" style="margin-bottom:0;">
+                  <input type="text" name="answer" class="input-field" required placeholder="输入问题答案">
+                  ${keyIconSvg}
+              </div>
+          </div>
 
-                ${siteKey ? `<div class="cf-turnstile" data-sitekey="${siteKey}" style="margin-bottom:20px;display:flex;justify-content:center"></div>` : ''}
-                <button type="submit" class="btn">立即注册</button>
-            </form>
-            <div class="text-center" style="margin-top:25px">
-                <a href="/login" class="link">已有账号？去登录</a>
-            </div>
-        </div>
+          ${siteKey ? `<div class="turnstile-container"><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="auto"></div></div>` : ''}
+          <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">立即注册</button>
+        </form>
+      </div>
+      
+      <div class="text-center" style="margin-top:20px;">
+          <a href="/login" style="color:var(--text-sub); text-decoration:none; font-size:0.9rem;">已有账号？去登录</a>
+      </div>
     </div>
-    </body></html>`;
+    <script>
+        function togglePwd() { const input = document.getElementById('pwdInput'); const icon = document.getElementById('eyeIcon'); if (input.type === 'password') { input.type = 'text'; icon.innerText = '🙈'; icon.style.opacity = '0.7'; } else { input.type = 'password'; icon.innerText = '👁️'; icon.style.opacity = '1'; } }
+    </script>
+  </body></html>`;
 }
 
 async function renderForgotPage(env, step, username, msg, siteKey, questionText) {
-    const qDisplay = questionText || '未知问题';
-    return new Response(`<!DOCTYPE html><html><head><title>重置密码</title>${commonHead}
-    ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
-    </head><body>
-    <div class="container">
-        <div class="card">
-            <h2>重置密码</h2>
-            <div class="steps">
-                <div class="step-line"></div>
-                <div class="step ${step === '1' ? 'active' : (step === '2' ? 'finished' : '')}">1</div>
-                <div class="step ${step === '2' ? 'active' : ''}">2</div>
-            </div>
-            
-            ${msg ? `<div class="err-msg">⚠️ ${msg}</div>` : ''}
-            
-            ${step === '1' ? `
-            <form action="/forgot-password" method="POST">
-                <input type="hidden" name="step" value="1">
-                <p class="subtitle">请输入您要找回的账号</p>
-                <div class="input-group">
-                    <input type="text" name="username" placeholder="请输入用户名或邮箱" required autofocus>
-                    <span class="input-icon">${icons.user}</span>
-                </div>
-                <button type="submit" class="btn">下一步 ➔</button>
-            </form>
-            ` : `
-            <form action="/forgot-password" method="POST">
-                <input type="hidden" name="step" value="2">
-                <input type="hidden" name="username" value="${username}">
-                <p class="subtitle">请完成安全验证</p>
-                
-                <div style="background:var(--primary-light); color:var(--primary); padding:18px; border-radius:var(--radius-input); margin-bottom:25px; font-weight:600; font-size:1rem; text-align:center; border:2px dashed var(--primary);">
-                   ❓ ${qDisplay}
-                </div>
-                
-                <div class="input-group">
-                    <input type="text" name="answer" placeholder="请输入安全问题答案" required>
-                    <span class="input-icon">${icons.key}</span>
-                </div>
-                
-                <div class="input-group" style="margin-top:20px">
-                    <input type="password" name="new_password" placeholder="设置新密码 (至少6位)" required minlength="6">
-                    <span class="input-icon">${icons.lock}</span>
-                </div>
-                
-                ${siteKey ? `<div class="cf-turnstile" data-sitekey="${siteKey}" style="margin-bottom:20px;display:flex;justify-content:center"></div>` : ''}
-                
-                <button type="submit" class="btn">确认重置</button>
-            </form>
-            `}
-            
-            <div class="text-center" style="margin-top:25px">
-                <a href="/login" class="link" style="color:var(--text-sub)">返回登录</a>
-            </div>
-        </div>
+  const qDisplay = escapeHtml(questionText) || '未知问题';
+  return new Response(`<!DOCTYPE html><html><head><title>重置密码 - Cloud Auth</title>${commonHead}
+  ${siteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
+  <style>body { align-items: center; background: var(--bg); }</style>
+  </head><body>
+    <div class="auth-container">
+      <div class="brand-section">${appIconSvg}<div class="brand-title">重置密码</div><div class="brand-subtitle">验证安全问题以找回权限</div></div>
+      <div class="card" style="padding: 30px 25px;">
+        ${msg ? `<div style="background:var(--danger-bg); color:var(--danger); padding:10px; border-radius:8px; font-size:0.9rem; text-align:center; margin-bottom:15px; display:flex; align-items:center; justify-content:center; gap:8px;"><span style="font-size:1.1rem">⚠️</span> ${msg}</div>` : ''}
+        
+        ${step === '1' ? `
+        <form action="/forgot-password" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
+          <input type="hidden" name="step" value="1">
+          <div class="input-group">
+            <input type="text" name="username" class="input-field" required placeholder="请输入要找回的用户名" autofocus>
+            ${userIconSvg}
+          </div>
+          <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">下一步</button>
+        </form>
+        ` : `
+        <form action="/forgot-password" method="POST" onsubmit="this.querySelector('.btn').classList.add('loading')">
+          <input type="hidden" name="step" value="2">
+          <input type="hidden" name="username" value="${escapeHtml(username)}">
+          
+          <div style="background:var(--primary); color:white; padding:15px; border-radius:10px; margin-bottom:20px; font-weight:600; font-size:0.95rem; text-align:center;">
+             ❓ ${qDisplay}
+          </div>
+
+          <div class="input-group">
+            <input type="text" name="answer" class="input-field" required placeholder="请输入安全问题答案">
+            ${keyIconSvg}
+          </div>
+          
+          <div class="input-group">
+            <input type="password" name="new_password" id="pwdInput" class="input-field" required placeholder="设置新密码 (至少6位)" minlength="6">
+            ${lockIconSvg}
+            <button type="button" class="toggle-password" onclick="togglePwd()" tabindex="-1"><span id="eyeIcon">👁️</span></button>
+          </div>
+
+          ${siteKey ? `<div class="turnstile-container"><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="auto"></div></div>` : ''}
+          <button type="submit" class="btn" style="margin-top: 5px; padding: 14px;">确认重置</button>
+        </form>
+        <script>
+            function togglePwd() { const input = document.getElementById('pwdInput'); const icon = document.getElementById('eyeIcon'); if (input.type === 'password') { input.type = 'text'; icon.innerText = '🙈'; icon.style.opacity = '0.7'; } else { input.type = 'password'; icon.innerText = '👁️'; icon.style.opacity = '1'; } }
+        </script>
+        `}
+      </div>
+      <div class="text-center" style="margin-top:20px;">
+          <a href="/login" style="color:var(--text-sub); text-decoration:none; font-size:0.9rem;">返回登录</a>
+      </div>
     </div>
-    </body></html>`, { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+  </body></html>`, { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
 }
 
 function renderDashboard(username, accounts) {
-  return `<!DOCTYPE html><html><head><title>Auth</title>${commonHead}
-  <style>
-     .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; } 
-     .btn-icon { background: var(--card-bg); border: 1px solid transparent; width: 42px; height: 42px; border-radius: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; transition: all 0.2s; color: var(--text-main); box-shadow: var(--shadow); }
-     .btn-icon:hover { transform: translateY(-3px); box-shadow: 0 10px 20px rgba(0,0,0,0.1); background: white; }
-     .fab { position: fixed; bottom: 40px; right: 30px; width: 64px; height: 64px; background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%); border-radius: 50%; display: flex; justify-content: center; align-items: center; color: white; font-size: 32px; box-shadow: 0 10px 25px rgba(79, 70, 229, 0.5); cursor: pointer; border: none; z-index: 90; transition: transform 0.2s; }
-     .fab:active { transform: scale(0.9); }
-     .empty-state { text-align: center; color: var(--text-sub); padding: 80px 0; }
-     .empty-icon { font-size: 5rem; margin-bottom: 20px; display: block; opacity: 0.3; }
-  </style>
-  </head><body>
-    <div class="container" style="max-width:440px">
+  const safeUsername = escapeHtml(username);
+  const accountsJson = JSON.stringify(accounts || []).replace(/</g, '\\u003c');
+
+  return `<!DOCTYPE html><html><head><title>Authenticator</title>${commonHead}</head><body>
+    <div id="toast" class="toast"></div>
+    <div class="container">
       <div class="header">
-        <div style="font-weight:700; font-size:1.2rem; display:flex; align-items:center; gap:10px;">
-            <div style="width:40px;height:40px;background:var(--primary);color:white;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;box-shadow:0 5px 15px rgba(79, 70, 229, 0.3);">👤</div>
-            ${username}
-        </div>
-        <div style="display:flex; gap:12px;">
-            <button onclick="toggleTheme()" class="btn-icon" title="切换主题">🌓</button>
-            <button onclick="openSettings()" class="btn-icon" title="设置">⚙️</button>
-            <a href="/logout" class="btn-icon" style="text-decoration:none" title="退出">🚪</a>
+        <div class="user-badge"><span>👤 ${safeUsername}</span></div>
+        <div class="header-actions">
+            <button onclick="toggleTheme()" id="theme-icon" class="btn-icon">☀️</button>
+            <button onclick="openSettings()" class="btn-icon">⚙️</button>
+            <a href="/logout" class="btn-icon" style="text-decoration:none;">🚪</a>
         </div>
       </div>
       
-      <div class="card" style="min-height:450px; padding: 10px 20px 80px 20px;">
+      <div id="settingsModal" class="modal">
+         <div class="card" style="width:100%; max-width:340px; margin:0;">
+             <h2>⚙️ 数据管理</h2>
+             
+             <div class="settings-section">
+                <div class="settings-title">数据备份</div>
+                <div class="settings-grid">
+                    <a href="/backup" class="btn btn-outline btn-block">⬇️ 下载当前</a>
+                    <button onclick="openBackupModal()" class="btn btn-outline btn-block">🕒 备份历史</button>
+                </div>
+             </div>
+
+             <div class="settings-section" style="margin-bottom:0">
+                <div class="settings-title">灾难恢复</div>
+                <button onclick="openRestoreModal()" class="btn btn-outline btn-block">↺ 进入恢复中心</button>
+             </div>
+
+             <div class="mt-4">
+                <button onclick="closeSettings()" class="btn btn-block">完成</button>
+             </div>
+         </div>
+      </div>
+
+      <div class="card" style="min-height: 300px; padding-bottom: 80px;">
         ${accounts.length === 0 ? `
-            <div class="empty-state">
-                <span class="empty-icon">📭</span>
-                <h3>暂无验证码</h3>
-                <p>点击右下角 + 号添加账户</p>
+            <div class="text-center" style="padding: 60px 0; opacity: 0.6;">
+                <div style="font-size: 3rem; margin-bottom: 10px;">📭</div>
+                <div class="text-sub">暂无账户<br>操作将自动触发备份</div>
             </div>
-        ` : '<div id="list"></div>'}
+        ` : ''}
+        <div id="list"></div>
       </div>
     </div>
 
-    <button class="fab" onclick="document.getElementById('addModal').classList.add('open')">+</button>
-
-    <div id="settingsModal" class="modal">
-        <div class="card" style="width:100%;max-width:320px;margin:0">
-            <h3>⚙️ 数据管理</h3>
-            <p class="subtitle">R2 云端备份控制台</p>
-            <a href="/backup" class="btn btn-outline" style="display:flex;justify-content:center;text-decoration:none;margin-bottom:15px">⬇️ 下载当前备份</a>
-            <button onclick="openBackupHistory()" class="btn btn-outline">🕒 备份历史 & 恢复</button>
-            <button onclick="document.getElementById('settingsModal').classList.remove('open')" class="btn" style="margin-top:25px;background:var(--card-bg);color:var(--text-main);box-shadow:none;border:1px solid var(--border)">关闭</button>
-        </div>
-    </div>
-
-    <div id="historyModal" class="modal">
-        <div class="card" style="width:100%;max-width:360px;margin:0;max-height:80vh;display:flex;flex-direction:column">
-            <h3>备份历史</h3>
-            <div id="historyList" style="overflow-y:auto; flex:1; margin-bottom:15px; border-top:1px solid var(--border); padding-top:10px;">加载中...</div>
-            <button onclick="document.getElementById('historyModal').classList.remove('open')" class="btn btn-outline">关闭</button>
-        </div>
-    </div>
+    <button class="fab" onclick="openAddModal()">+</button>
 
     <div id="addModal" class="modal">
-        <div class="card" style="width:100%;max-width:340px;margin:0">
-            <h3>添加账户</h3>
-            <div id="scanner" style="display:none;background:#000;height:250px;margin-bottom:15px;border-radius:16px;overflow:hidden;"><canvas id="qr-canvas" style="width:100%;height:100%"></canvas></div>
-            <button id="scanBtn" onclick="startScan()" class="btn btn-outline" style="margin-bottom:20px">📷 扫描二维码</button>
-            <form action="/add" method="POST">
-                <div class="input-group">
-                    <input id="inpIssuer" type="text" name="issuer" placeholder="服务商 (如 Google, GitHub)" required>
-                    <span class="input-icon">${icons.shield}</span>
-                </div>
-                <div class="input-group">
-                    <input id="inpSecret" type="text" name="secret" placeholder="密钥 (Base32)" required>
-                    <span class="input-icon">${icons.key}</span>
-                </div>
-                <div class="flex-between" style="gap:15px; margin-top:30px;">
-                    <button type="button" class="btn btn-outline" onclick="closeAdd()">取消</button>
-                    <button type="submit" class="btn">保存</button>
-                </div>
-            </form>
+      <div class="card" style="width:100%; max-width:340px; margin:0;">
+        <h2>添加账户</h2>
+        
+        <div id="scannerContainer">
+            <canvas id="qr-canvas"></canvas>
+            <button onclick="stopScan()" class="btn-sm btn-danger" style="position:absolute; bottom:10px; left:50%; transform:translateX(-50%); z-index:10;">停止扫描</button>
         </div>
+        <button type="button" onclick="startScan()" id="scanBtn" class="btn btn-outline btn-block" style="margin-bottom:15px;">📷 扫描二维码</button>
+
+        <form action="/add" method="POST">
+          <label class="text-sub">服务商 / 备注</label>
+          <input type="text" id="inpIssuer" name="issuer" placeholder="例如: Google" required maxlength="64">
+          <label class="text-sub">密钥 (Key)</label>
+          <input type="text" id="inpSecret" name="secret" placeholder="粘贴 Base32 密钥" required autocomplete="off">
+          <div class="flex-gap mt-4">
+            <button type="button" class="btn btn-outline" onclick="closeAddModal()">取消</button>
+            <button type="submit" class="btn">保存</button>
+          </div>
+        </form>
+      </div>
     </div>
-    
-    <div id="delModal" class="modal">
-        <div class="card" style="width:300px;text-align:center">
-            <div style="font-size:4rem;margin-bottom:10px">🗑️</div>
-            <h3>确定删除?</h3>
-            <p class="subtitle">此操作无法撤销，请确保已备份。</p>
-            <form action="/delete" method="POST">
-                <input type="hidden" name="id" id="delId">
-                <div class="flex-between" style="gap:15px">
-                    <button type="button" class="btn btn-outline" onclick="document.getElementById('delModal').classList.remove('open')">取消</button>
-                    <button type="submit" class="btn" style="background:linear-gradient(135deg, #ef4444 0%, #dc2626 100%); box-shadow: 0 10px 20px -5px rgba(239, 68, 68, 0.4);">确认删除</button>
-                </div>
-            </form>
+
+    <div id="deleteModal" class="modal">
+      <div class="card" style="width:100%; max-width:320px; margin:0; text-align:center;">
+        <div class="icon-box-danger">🗑️</div>
+        <h2 style="font-size:1.2rem; margin-bottom: 0.5rem;">确定删除?</h2>
+        <p id="deleteMsg" class="text-sub" style="margin-bottom: 20px;">删除操作无法撤销，数据将永久丢失。</p>
+        <form action="/delete" method="POST">
+            <input type="hidden" id="deleteId" name="id" value="">
+            <div class="flex-gap">
+                <button type="button" class="btn btn-outline" onclick="closeDeleteModal()">取消</button>
+                <button type="submit" class="btn btn-danger">确认删除</button>
+            </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="backupModal" class="modal">
+      <div class="card" style="width:100%; max-width:340px; margin:0; max-height:80vh; display:flex; flex-direction:column;">
+        <h2>备份历史</h2>
+        <p class="text-sub text-center" style="margin-bottom:15px;">点击列表下载对应文件</p>
+        <div id="backupListContainer" class="backup-list">
+            <div class="text-center text-sub" style="padding:20px;">加载中...</div>
         </div>
+        <div class="mt-4">
+            <button type="button" class="btn btn-outline btn-block" onclick="backToSettings()">返回</button>
+        </div>
+      </div>
     </div>
 
     <div id="restoreModal" class="modal">
-        <div class="card" style="width:300px;text-align:center">
-            <div style="font-size:4rem;margin-bottom:10px">↺</div>
-            <h3>确认恢复?</h3>
-            <p id="restoreMsg" class="subtitle">当前数据将被覆盖，此操作不可撤销。</p>
-            <form action="/restore" method="POST">
-                <input type="hidden" name="r2_key" id="restoreKey">
-                <div class="flex-between" style="gap:15px">
-                    <button type="button" class="btn btn-outline" onclick="document.getElementById('restoreModal').classList.remove('open')">取消</button>
-                    <button type="submit" class="btn">确认恢复</button>
-                </div>
-            </form>
+      <div class="card" style="width:100%; max-width:340px; margin:0; max-height:80vh; display:flex; flex-direction:column;">
+        <h2>恢复数据</h2>
+        
+        <div style="margin-bottom: 20px;">
+             <p class="text-sub text-center" style="margin-bottom:10px;">方法一：从本地上传</p>
+             <button onclick="document.getElementById('restoreInput').click()" class="btn btn-block">📂 选择 JSON 文件</button>
+             <form id="restoreForm" action="/restore" method="POST" enctype="multipart/form-data">
+                <input type="file" id="restoreInput" name="backup_file" accept=".json" style="display:none" onchange="if(confirm('本地文件将覆盖现有数据，确定吗？')) document.getElementById('restoreForm').submit()">
+             </form>
         </div>
+        
+        <div style="border-top: 1px solid var(--border); padding-top: 15px; flex: 1; overflow: hidden; display: flex; flex-direction: column;">
+            <p class="text-sub text-center" style="margin-bottom:10px;">方法二：从云端回滚</p>
+            <div id="restoreListContainer" class="backup-list">
+                <div class="text-center text-sub" style="padding:20px;">加载中...</div>
+            </div>
+        </div>
+
+        <div class="mt-4">
+            <button type="button" class="btn btn-outline btn-block" onclick="backToSettings()">返回</button>
+        </div>
+      </div>
     </div>
 
     <script>
-        const accounts = ${JSON.stringify(accounts)};
-        function renderList() {
-            if(!accounts.length) return;
-            document.getElementById('list').innerHTML = accounts.map(acc => \`
-                <div class="auth-item">
-                    <div style="flex:1;overflow:hidden;padding-right:15px;">
-                        <div style="font-size:0.9rem;color:var(--text-sub);font-weight:600;margin-bottom:6px;">\${acc.issuer}</div>
-                        <div class="auth-code" id="code-\${acc.id}" onclick="copy('\${acc.id}')">...</div>
-                        <div style="height:6px;background:rgba(0,0,0,0.05);border-radius:10px;margin-top:10px;max-width:120px;overflow:hidden;">
-                            <div class="auth-timer-bar" id="bar-\${acc.id}" style="width:100%;height:100%;background:var(--success);transition:width 1s linear;border-radius:10px;"></div>
-                        </div>
-                    </div>
-                    <button onclick="openDel('\${acc.id}')" style="background:none;border:none;font-size:1.3rem;cursor:pointer;color:var(--text-sub);padding:10px;border-radius:12px;transition:all 0.2s;" onmouseover="this.style.background='rgba(239,68,68,0.1)';this.style.color='var(--danger)'" onmouseout="this.style.background='none';this.style.color='var(--text-sub)'">🗑️</button>
-                </div>
-            \`).join('');
-        }
-        
-        async function genToken(secret) {
-            try {
-                const keyData = base32ToBuf(secret);
-                const epoch = Math.floor(Date.now() / 1000);
-                const counter = Math.floor(epoch / 30);
-                const data = new ArrayBuffer(8);
-                new DataView(data).setBigUint64(0, BigInt(counter), false);
-                const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-                const sig = await crypto.subtle.sign('HMAC', key, data);
-                const h = new Uint8Array(sig);
-                const off = h[h.length - 1] & 0x0f;
-                const v = ((h[off] & 0x7f) << 24) | ((h[off + 1] & 0xff) << 16) | ((h[off + 2] & 0xff) << 8) | (h[off + 3] & 0xff);
-                return (v % 1000000).toString().padStart(6, '0');
-            } catch(e) { return 'ERROR'; }
-        }
-        
-        function base32ToBuf(str) {
-            const a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-            let v = 0, b = 0, out = [];
-            str = str.replace(/\\s+/g, '').toUpperCase().replace(/=+$/, '');
-            for (let i = 0; i < str.length; i++) {
-                const idx = a.indexOf(str[i]);
-                if (idx === -1) continue;
-                v = (v << 5) | idx; b += 5;
-                if (b >= 8) { out.push((v >>> (b - 8)) & 0xff); b -= 8; }
-            }
-            return new Uint8Array(out);
-        }
-        
-        async function update() {
-            const sec = Math.floor(Date.now()/1000) % 30;
-            const pct = ((30 - sec) / 30) * 100;
-            for (let acc of accounts) {
-                const c = document.getElementById('code-'+acc.id);
-                const b = document.getElementById('bar-'+acc.id);
-                if(c && b) {
-                    if (sec === 0 || c.innerText === '...' || c.innerText === 'ERROR') c.innerText = await genToken(acc.secret);
-                    b.style.width = pct + '%';
-                    if (pct < 17) {
-                        b.style.background = 'var(--danger)';
-                    } else if (pct < 50) {
-                        b.style.background = 'var(--primary)';
-                    } else {
-                        b.style.background = 'var(--success)';
-                    }
-                }
-            }
-        }
-        
-        function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
-        function openDel(id) { document.getElementById('delId').value = id; document.getElementById('delModal').classList.add('open'); }
-        function closeAdd() { stopScan(); document.getElementById('addModal').classList.remove('open'); }
-        function copy(id) { 
-            const t = document.getElementById('code-'+id).innerText;
-            navigator.clipboard.writeText(t);
-            const el = document.getElementById('code-'+id);
-            const raw = el.innerText;
-            el.innerText = 'COPIED';
-            setTimeout(() => el.innerText = raw, 800);
-        }
-        
-        function openRestoreConfirm(key, date) {
-            document.getElementById('restoreKey').value = key;
-            document.getElementById('restoreMsg').innerText = \`即将回滚至 \${date}，当前数据将被覆盖。\`;
-            document.getElementById('restoreModal').classList.add('open');
-        }
+      const accounts = ${accountsJson};
+      
+      function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
+      function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
+      
+      function backToSettings() {
+          document.getElementById('backupModal').classList.remove('open');
+          document.getElementById('restoreModal').classList.remove('open');
+          openSettings();
+      }
 
-        async function openBackupHistory() {
-            document.getElementById('settingsModal').classList.remove('open');
-            document.getElementById('historyModal').classList.add('open');
-            const res = await fetch('/backups/list');
-            const list = await res.json();
-            const el = document.getElementById('historyList');
-            if(list.length === 0) el.innerHTML = '<div class="text-center subtitle">暂无历史备份</div>';
-            else {
-                el.innerHTML = list.map(f => {
-                    const displayTime = f.key.split('/').pop().replace('.json','').replace('_auto','').replace('T',' ');
-                    return \`
-                    <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-                        <div>
-                            <div style="font-weight:600;font-size:0.9rem">\${displayTime}</div>
-                            <div style="font-size:0.75rem;color:var(--text-sub)">\${(f.size/1024).toFixed(2)} KB</div>
-                        </div>
-                        <button class="btn btn-outline" style="padding:6px 12px;font-size:0.8rem;width:auto;" onclick="openRestoreConfirm('\${f.key}', '\${displayTime}')">恢复</button>
-                    </div>\`;
-                }).join('');
-            }
-        }
-        
-        let videoStream;
-        function startScan() {
-            const v = document.createElement('video');
-            const c = document.getElementById('qr-canvas');
-            const ctx = c.getContext('2d');
-            document.getElementById('scanBtn').style.display='none';
-            document.getElementById('scanner').style.display='block';
-            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } }).then(s => {
-                videoStream = s; v.srcObject = s; v.setAttribute("playsinline", true); v.play();
+      function openAddModal() { document.getElementById('addModal').classList.add('open'); }
+      function closeAddModal() { stopScan(); document.getElementById('addModal').classList.remove('open'); }
+      function closeBackupModal() { document.getElementById('backupModal').classList.remove('open'); }
+      function closeRestoreModal() { document.getElementById('restoreModal').classList.remove('open'); }
+
+      function openDeleteModal(id, issuer) {
+         document.getElementById('deleteId').value = id;
+         document.getElementById('deleteMsg').textContent = \`确定要删除 \${issuer} 吗？\`;
+         document.getElementById('deleteModal').classList.add('open');
+      }
+      function closeDeleteModal() { document.getElementById('deleteModal').classList.remove('open'); }
+
+      async function openBackupModal() {
+          const modal = document.getElementById('backupModal');
+          const container = document.getElementById('backupListContainer');
+          closeSettings();
+          modal.classList.add('open');
+          await loadBackupList(container, 'download');
+      }
+
+      async function openRestoreModal() {
+          const modal = document.getElementById('restoreModal');
+          const container = document.getElementById('restoreListContainer');
+          closeSettings();
+          modal.classList.add('open');
+          await loadBackupList(container, 'restore');
+      }
+
+      async function loadBackupList(container, mode) {
+          try {
+              const res = await fetch('/backups/list');
+              const files = await res.json();
+              let html = '';
+              
+              if(files.length === 0) { 
+                  html = '<div class="text-center text-sub" style="padding:20px;">暂无历史备份</div>'; 
+              } else {
+                  files.forEach(f => {
+                      // 适配多用户路径：提取最后的文件名部分
+                      const filename = f.key.split('/').pop();
+                      const rawTime = filename.replace('_auto.json', '');
+                      const dateStr = rawTime.replace('_', ' ').replace(/-/g, ':').replace(/:/,'-').replace(/:/,'-'); 
+                      const parts = rawTime.split('_');
+                      const datePart = parts[0];
+                      const timePart = parts[1].replace(/-/g, ':');
+                      const displayStr = \`\${datePart} \${timePart}\`;
+                      
+                      if (mode === 'download') {
+                          html += \`<a href="/backup?file=\${f.key}" class="backup-item"><div class="backup-date">\${displayStr}</div><div class="backup-size">下载</div></a>\`;
+                      } else {
+                          html += \`
+                            <div class="backup-item">
+                                <div class="backup-date">\${displayStr}</div>
+                                <form action="/restore" method="POST" style="margin:0" onsubmit="return confirm('确定回滚到 \${displayStr} 吗？')">
+                                    <input type="hidden" name="r2_key" value="\${f.key}">
+                                    <button type="submit" class="restore-action-btn">恢复</button>
+                                </form>
+                            </div>\`;
+                      }
+                  });
+              }
+              container.innerHTML = html;
+          } catch(e) { container.innerHTML = '<div class="text-center text-sub" style="color:var(--danger)">加载失败</div>'; }
+      }
+
+      // --- 扫码逻辑 ---
+      let videoStream = null;
+      let scanning = false;
+
+      function startScan() {
+          const container = document.getElementById('scannerContainer');
+          const canvas = document.getElementById('qr-canvas');
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          const scanBtn = document.getElementById('scanBtn');
+          
+          scanBtn.style.display = 'none';
+          container.style.display = 'block';
+          
+          navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+            .then(stream => {
+                videoStream = stream;
+                scanning = true;
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                video.setAttribute('playsinline', true);
+                video.play();
                 requestAnimationFrame(tick);
+
                 function tick() {
-                    if (v.readyState === v.HAVE_ENOUGH_DATA) {
-                        c.height = v.videoHeight; c.width = v.videoWidth;
-                        ctx.drawImage(v, 0, 0, c.width, c.height);
-                        const i = ctx.getImageData(0, 0, c.width, c.height);
-                        const code = jsQR(i.data, i.width, i.height, { inversionAttempts: "dontInvert" });
+                    if (!scanning) return;
+                    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                        canvas.height = video.videoHeight;
+                        canvas.width = video.videoWidth;
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "dontInvert" });
+                        
                         if (code) {
-                           try {
-                               const u = new URL(code.data);
-                               if(u.protocol==='otpauth:') {
-                                   document.getElementById('inpSecret').value = u.searchParams.get('secret');
-                                   let iss = u.searchParams.get('issuer');
-                                   if(!iss && u.pathname.includes(':')) iss = u.pathname.split(':')[0].replace('/','');
-                                   if(iss) document.getElementById('inpIssuer').value = iss;
-                                   closeAdd(); document.getElementById('addModal').classList.add('open');
-                               }
-                           } catch(e){}
-                           stopScan();
+                            parseOTPAuth(code.data);
+                            stopScan();
+                            showToast("识别成功！");
                         }
                     }
-                    if(videoStream) requestAnimationFrame(tick);
+                    requestAnimationFrame(tick);
                 }
+            })
+            .catch(err => {
+                alert("无法访问摄像头，请确保已授权。");
+                stopScan();
             });
-        }
-        function stopScan(){ if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null;} document.getElementById('scanner').style.display='none'; document.getElementById('scanBtn').style.display='block'; }
-        renderList();
-        setInterval(update, 1000); update();
+      }
+
+      function stopScan() {
+          scanning = false;
+          if (videoStream) {
+              videoStream.getTracks().forEach(track => track.stop());
+              videoStream = null;
+          }
+          document.getElementById('scannerContainer').style.display = 'none';
+          document.getElementById('scanBtn').style.display = 'block';
+      }
+
+      function parseOTPAuth(url) {
+          try {
+              const u = new URL(url);
+              if (u.protocol !== 'otpauth:') return alert('无效的 OTP 二维码');
+              
+              const params = u.searchParams;
+              const secret = params.get('secret');
+              let issuer = params.get('issuer');
+              
+              if (!issuer) {
+                  const path = decodeURIComponent(u.pathname.replace('//', ''));
+                  const parts = path.split(':');
+                  if (parts.length > 0) issuer = parts[0].replace('totp/', '');
+              }
+
+              if (secret) document.getElementById('inpSecret').value = secret;
+              if (issuer) document.getElementById('inpIssuer').value = issuer;
+          } catch (e) { alert('解析失败'); }
+      }
+
+      function copyCode(code) {
+        if(code === 'ERROR' || code === '...') return;
+        if(navigator.vibrate) navigator.vibrate(50);
+        navigator.clipboard.writeText(code).then(() => showToast('已复制: ' + code));
+      }
+
+      function base32ToBuf(str) {
+          const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+          let bits = 0, value = 0, output = [];
+          str = str.replace(/\\s+/g, '').toUpperCase().replace(/=+$/, '');
+          for (let i = 0; i < str.length; i++) {
+              const idx = alphabet.indexOf(str[i]);
+              if (idx === -1) continue;
+              value = (value << 5) | idx;
+              bits += 5;
+              if (bits >= 8) { output.push((value >>> (bits - 8)) & 0xff); bits -= 8; }
+          }
+          return new Uint8Array(output);
+      }
+
+      async function generateToken(secret) {
+          try {
+              if (!window.crypto || !window.crypto.subtle) return 'HTTPS!';
+              const keyData = base32ToBuf(secret);
+              if (keyData.length === 0) return 'EMPTY';
+              const epoch = Math.floor(Date.now() / 1000);
+              const counter = Math.floor(epoch / 30);
+              const data = new ArrayBuffer(8);
+              new DataView(data).setBigUint64(0, BigInt(counter), false);
+              const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+              const signature = await window.crypto.subtle.sign('HMAC', key, data);
+              const hmac = new Uint8Array(signature);
+              const offset = hmac[hmac.length - 1] & 0x0f;
+              const codeVal = ((hmac[offset] & 0x7f) << 24) | ((hmac[offset + 1] & 0xff) << 16) | ((hmac[offset + 2] & 0xff) << 8) | (hmac[offset + 3] & 0xff);
+              return (codeVal % 1000000).toString().padStart(6, '0');
+          } catch(e) { return 'ERROR'; }
+      }
+
+      async function updateCodes() {
+          const list = document.getElementById('list');
+          const epoch = Math.floor(Date.now() / 1000);
+          const seconds = epoch % 30;
+          const percent = ((30 - seconds) / 30) * 100;
+          
+          if (list.innerHTML === '' && accounts.length > 0) {
+              list.innerHTML = accounts.map(acc => {
+                  const safeIssuer = escapeHtml(acc.issuer);
+                  const safeId = escapeHtml(acc.id);
+                  return \`
+                  <div class="auth-item">
+                      <div class="auth-info">
+                          <div class="auth-issuer">\${safeIssuer}</div>
+                          <div class="auth-code" id="code-\${safeId}" onclick="copyCode(this.innerText)">...</div>
+                          <div class="auth-timer"><div class="auth-timer-bar" id="bar-\${safeId}"></div></div>
+                      </div>
+                      <button onclick="openDeleteModal('\${safeId}', '\${safeIssuer.replace(/'/g, "\\'")}')" class="delete-btn" title="删除">🗑️</button>
+                  </div>
+              \`}).join('');
+          }
+
+          for (let acc of accounts) {
+              const safeId = escapeHtml(acc.id);
+              const codeEl = document.getElementById(\`code-\${safeId}\`);
+              const barEl = document.getElementById(\`bar-\${safeId}\`);
+              if(codeEl && barEl) {
+                  if (seconds === 0 || codeEl.innerText === '...' || codeEl.innerText === 'ERROR') {
+                      codeEl.innerText = await generateToken(acc.secret);
+                      codeEl.style.opacity = '0.5'; setTimeout(()=>codeEl.style.opacity = '1', 200);
+                  }
+                  barEl.style.width = \`\${percent}%\`;
+                  
+                  if (percent < 15) {
+                      barEl.style.background = 'var(--danger)';
+                      codeEl.style.color = 'var(--danger)';
+                  } else if (percent < 50) {
+                      barEl.style.background = 'var(--primary)';
+                      codeEl.style.color = 'var(--code-color)';
+                  } else {
+                      barEl.style.background = '#10b981';
+                      codeEl.style.color = '#10b981';
+                  }
+              }
+          }
+      }
+      setInterval(updateCodes, 1000);
+      updateCodes();
     </script>
   </body></html>`;
 }
