@@ -4,7 +4,14 @@ const SESSION_COOKIE_NAME = 'web_auth_session';
 const MAX_BACKUPS = 20; 
 
 // --- PWA 配置 ---
-const PWA_VERSION = 'v1.1.2'; // 版本升级，配合登录页清理逻辑确保更新
+const PWA_VERSION = 'v1.1.3'; // 版本升级，配合登录页清理逻辑确保更新
+
+// --- 接口路径 ---
+// 这些路径由前端 fetch() 调用并要求 JSON 响应。
+// 未登录时必须返回 401 JSON，绝不能返回登录页 HTML ——
+// 否则前端 res.json() 解析 HTML 会抛 SyntaxError，界面只能显示一句无信息量的「加载失败」。
+const API_PATHS = ['/backups/list', '/settings/turnstile'];
+function isApiPath(path) { return API_PATHS.indexOf(path) !== -1; }
 
 // --- 安全工具函数 (后端用) ---
 function escapeHtml(unsafe) {
@@ -56,6 +63,10 @@ export default {
     if (path === '/logout') return logoutResponse();
 
     if (!isLoggedIn) {
+      // 按请求类型区分响应，别让接口请求拿到一坨 HTML：
+      //   接口(fetch) → 401 JSON；下载链接 → 302 到登录页；页面 → 渲染登录页
+      if (isApiPath(path)) return jsonResponse({ error: 'unauthorized' }, 401);
+      if (path === '/backup') return new Response(null, { status: 302, headers: { 'Location': '/login' } });
       return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
@@ -491,9 +502,18 @@ async function handleDownloadBackup(request, env) {
 }
 
 async function handleListBackups(env) {
-    const list = await env.DB.list({ prefix: 'backups/' });
-    const files = list.objects.reverse().map(obj => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded }));
-    return jsonResponse(files);
+    try {
+        const list = await env.DB.list({ prefix: 'backups/' });
+        // R2 list() 按 key 字典序升序返回，这里显式降序排出「最新的在最前」，
+        // 不依赖底层返回顺序。原来用的 reverse() 是原地翻转，语义不如显式排序清晰。
+        const files = (list.objects || [])
+            .map(obj => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded }))
+            .sort((a, b) => String(b.key).localeCompare(String(a.key)));
+        return jsonResponse(files);
+    } catch (e) {
+        // 兜底：把异常转成 JSON，前端才能显示可读原因，而不是拿到一个 500 HTML 错误页
+        return jsonResponse({ error: 'list_failed', message: String((e && e.message) || e) }, 500);
+    }
 }
 
 async function handleRestore(request, env) {
@@ -1065,40 +1085,117 @@ function renderDashboard(username, accounts, turnstileView) {
           await loadBackupList(container, 'restore');
       }
 
+      // 从备份文件名解析出可读时间；解析不出来就退回显示原始文件名，
+      // 绝不让一个命名不规范的文件把整个列表搞崩。
+      function fmtBackupName(key) {
+          const filename = String(key).split('/').pop();
+          const raw = filename.split('_auto.json')[0].split('.json')[0];
+          const parts = raw.split('_');
+          if (parts.length >= 2 && parts[0].length === 10 && parts[1].length === 8) {
+              return parts[0] + ' ' + parts[1].replace(/-/g, ':');
+          }
+          return filename;
+      }
+
+      function renderBackupError(container, mode, msg) {
+          container.innerHTML = '';
+          const box = document.createElement('div');
+          box.className = 'text-center';
+          box.style.padding = '20px';
+          const p = document.createElement('div');
+          p.className = 'text-sub';
+          p.style.color = 'var(--danger)';
+          p.style.marginBottom = '10px';
+          p.textContent = msg;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn btn-outline btn-sm';
+          btn.textContent = '重试';
+          btn.addEventListener('click', function () { loadBackupList(container, mode); });
+          box.appendChild(p);
+          box.appendChild(btn);
+          container.appendChild(box);
+      }
+
       async function loadBackupList(container, mode) {
+          container.innerHTML = '<div class="text-center text-sub" style="padding:20px;">加载中...</div>';
+
+          let res;
           try {
-              const res = await fetch('/backups/list');
-              const files = await res.json();
-              let html = '';
-              
-              if(files.length === 0) { 
-                  html = '<div class="text-center text-sub" style="padding:20px;">暂无历史备份</div>'; 
-              } else {
-                  files.forEach(f => {
-                      const rawTime = f.key.replace('backups/', '').replace('_auto.json', '');
-                      const dateStr = rawTime.replace('_', ' ').replace(/-/g, ':').replace(/:/,'-').replace(/:/,'-'); 
-                      const parts = rawTime.split('_');
-                      const datePart = parts[0];
-                      const timePart = parts[1].replace(/-/g, ':');
-                      const displayStr = \`\${datePart} \${timePart}\`;
-                      
-                      // 注意：文件名是后端生成的，相对安全，但作为最佳实践，不应信任任何输入
-                      if (mode === 'download') {
-                          html += \`<a href="/backup?file=\${f.key}" class="backup-item"><div class="backup-date">\${displayStr}</div><div class="backup-size">下载</div></a>\`;
-                      } else {
-                          html += \`
-                            <div class="backup-item">
-                                <div class="backup-date">\${displayStr}</div>
-                                <form action="/restore" method="POST" style="margin:0" onsubmit="return confirm('确定回滚到 \${displayStr} 吗？')">
-                                    <input type="hidden" name="r2_key" value="\${f.key}">
-                                    <button type="submit" class="restore-action-btn">恢复</button>
-                                </form>
-                            </div>\`;
-                      }
-                  });
+              res = await fetch('/backups/list', { credentials: 'same-origin' });
+          } catch (e) {
+              return renderBackupError(container, mode, '网络请求失败，请检查网络后重试');
+          }
+
+          // 先按状态码给出可读原因，避免把 HTML 错误页当成 JSON 去解析
+          if (res.status === 401) return renderBackupError(container, mode, '登录已过期，请重新登录');
+          if (res.status === 403) return renderBackupError(container, mode, '没有权限查看备份列表');
+
+          let files;
+          try {
+              files = await res.json();
+          } catch (e) {
+              return renderBackupError(container, mode, '服务端返回了非 JSON 内容（HTTP ' + res.status + '）');
+          }
+
+          if (!res.ok) {
+              const detail = (files && files.message) ? files.message : ('HTTP ' + res.status);
+              return renderBackupError(container, mode, '服务端错误：' + detail);
+          }
+          if (!Array.isArray(files)) {
+              return renderBackupError(container, mode, '备份列表格式异常');
+          }
+          if (files.length === 0) {
+              container.innerHTML = '<div class="text-center text-sub" style="padding:20px;">暂无历史备份<br><span style="font-size:0.8rem;opacity:0.7">增删账户后会自动生成备份</span></div>';
+              return;
+          }
+
+          // 用 DOM 构建而不是拼 HTML 字符串：既免去多层引号转义，也天然免疫 XSS
+          container.innerHTML = '';
+          files.forEach(function (f) {
+              const display = fmtBackupName(f.key);
+
+              const label = document.createElement('div');
+              label.className = 'backup-date';
+              label.textContent = display;
+
+              if (mode === 'download') {
+                  const a = document.createElement('a');
+                  a.className = 'backup-item';
+                  a.href = '/backup?file=' + encodeURIComponent(f.key);
+                  a.appendChild(label);
+                  const d = document.createElement('div');
+                  d.className = 'backup-size';
+                  d.textContent = '下载';
+                  a.appendChild(d);
+                  container.appendChild(a);
+                  return;
               }
-              container.innerHTML = html;
-          } catch(e) { container.innerHTML = '<div class="text-center text-sub" style="color:var(--danger)">加载失败</div>'; }
+
+              const item = document.createElement('div');
+              item.className = 'backup-item';
+              item.appendChild(label);
+
+              const form = document.createElement('form');
+              form.action = '/restore';
+              form.method = 'POST';
+              form.style.margin = '0';
+              const input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = 'r2_key';
+              input.value = f.key;
+              form.appendChild(input);
+              const btn = document.createElement('button');
+              btn.type = 'submit';
+              btn.className = 'restore-action-btn';
+              btn.textContent = '恢复';
+              form.appendChild(btn);
+              form.addEventListener('submit', function (ev) {
+                  if (!confirm('确定回滚到 ' + display + ' 吗？')) ev.preventDefault();
+              });
+              item.appendChild(form);
+              container.appendChild(item);
+          });
       }
 
       // --- 扫码逻辑 ---
