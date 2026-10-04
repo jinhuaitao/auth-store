@@ -9,6 +9,13 @@ const PWA_VERSION = 'v1.1.2'; // 版本升级，配合登录页清理逻辑确�
 const PREFIX_USER = 'usr/'; // 用户档案 (密码、密保等)
 const PREFIX_DATA = 'dat/'; // 2FA 数据
 const PREFIX_SESS = 'sess/'; // 会话
+const PREFIX_SYS  = 'sys/';  // 系统级数据（管理员、全局设置）
+
+// 管理员：第一个注册的用户自动成为管理员，之后只有他能改系统设置。
+// 惰性补录：若库里已有用户但没有 admin 记录（例如从旧版本升级上来），
+// 取 created_at 最小的那个补上，否则升级后没人能进设置页。
+const ADMIN_KEY = PREFIX_SYS + 'admin';
+const SETTINGS_KEY = PREFIX_SYS + 'settings.json';
 
 // --- 安全工具函数 (后端用) ---
 function escapeHtml(unsafe) {
@@ -36,19 +43,21 @@ export default {
     if (path === '/sw.js') return handleServiceWorker();
     if (path === '/app-icon.svg') return handleAppIcon();
 
-    const siteKey = env.TURNSTILE_SITE_KEY || null;
+    // 人机验证配置：优先应用内设置（存 R2），其次环境变量，两者都没有则自动关闭
+    const ts = await resolveTurnstile(env);
+    const siteKey = ts.siteKey;
 
     // --- 公开路由 (登录、注册、找回密码) ---
     if (path === '/login') {
-        if (request.method === 'POST') return await handleLogin(request, env);
+        if (request.method === 'POST') return await handleLogin(request, env, ts);
         return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
     if (path === '/register') {
-        if (request.method === 'POST') return await handleRegister(request, env);
+        if (request.method === 'POST') return await handleRegister(request, env, ts);
         return new Response(renderRegisterPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
     if (path === '/forgot-password') {
-        if (request.method === 'POST') return await handleForgotPassword(request, env);
+        if (request.method === 'POST') return await handleForgotPassword(request, env, ts);
         const step = url.searchParams.get('step') || '1';
         const username = url.searchParams.get('u') || '';
         return await renderForgotPage(env, step, username, null, siteKey);
@@ -58,6 +67,11 @@ export default {
     // --- 鉴权拦截 ---
     const user = await getCurrentUser(request, env);
     if (!user) {
+        // [修复] 接口请求返回 401 JSON 而不是 302 到 HTML 登录页，
+        // 否则前端 fetch 会跟着重定向拿到一坨 HTML，res.json() 直接抛异常
+        if (path.startsWith('/settings/') || path === '/backups/list') {
+            return jsonResponse({ error: 'unauthorized' }, 401);
+        }
         if (path === '/') return new Response(renderLoginPage(false, null, siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
         return new Response(null, { status: 302, headers: { 'Location': '/login' } });
     }
@@ -71,6 +85,10 @@ export default {
     if (path === '/backup') return await handleDownloadBackup(request, env, user);
     if (path === '/backups/list') return await handleListBackups(env, user);
     if (path === '/restore' && request.method === 'POST') return await handleRestore(request, env, user);
+
+    // 系统设置：人机验证密钥（仅管理员，免去登录 Cloudflare 控制台配环境变量）
+    if (path === '/settings/turnstile' && request.method === 'GET') return await handleGetTurnstileSettings(env, user);
+    if (path === '/settings/turnstile' && request.method === 'POST') return await handleSaveTurnstileSettings(request, env, user);
 
     return new Response('Not Found', { status: 404 });
   }
@@ -166,15 +184,21 @@ function handleServiceWorker() {
         self.clients.claim();
     });
 
+    // [安全修复] 白名单：只有这里列出的静态资源才允许被缓存
+    const STATIC_ASSET_PATHS = ['/app-icon.svg', '/manifest.json'];
+
     self.addEventListener('fetch', event => {
         if (event.request.method !== 'GET') return;
-        
+
         const url = new URL(event.request.url);
-        
-        // [安全修复] 明确排除根路径和任何非静态资源
-        if (url.pathname === '/' || url.pathname.startsWith('/api') || url.pathname === '/login' || url.pathname === '/register') {
-             return; 
-        }
+
+        // [安全修复] 改为白名单策略。原实现是逐条排除 /、/api、/login、/register，
+        // 但本应用的数据接口并不在 /api 下（/backups/list、/backup 等），
+        // 它们的响应会被写进 Cache，导致同一设备换账号后读到上一个人的
+        // 备份列表 / 备份文件（隐私泄漏）。白名单之外一律不拦截、不缓存。
+        const isSameOriginStatic = url.origin === self.location.origin && STATIC_ASSET_PATHS.indexOf(url.pathname) !== -1;
+        const isCdnStatic = url.hostname === 'cdn.jsdelivr.net';
+        if (!isSameOriginStatic && !isCdnStatic) return;
 
         event.respondWith(
             caches.match(event.request)
@@ -240,6 +264,87 @@ async function verifyTurnstileToken(secret, token, ip) {
     } catch (e) { return false; }
 }
 
+// --- 应用内设置：人机验证密钥（存 R2，部署后无需再登录 Cloudflare 控制台）---
+const DEFAULT_SETTINGS = { turnstileSiteKey: '', turnstileSecretKey: '' };
+
+async function getSettings(env) {
+    const data = await r2Get(env, SETTINGS_KEY);
+    return Object.assign({}, DEFAULT_SETTINGS, data || {});
+}
+
+async function saveSettings(env, settings) {
+    await r2Put(env, SETTINGS_KEY, settings);
+}
+
+// [设计] 不引入额外的 enabled 开关字段 —— 两个密钥都填了就算启用，
+// 少一个状态就少一类 bug（不会出现「开关是开的但密钥是空的」这种矛盾态）。
+// 优先级：应用内设置 > 环境变量。保留 env 回退，方便随时切回控制台配置。
+async function resolveTurnstile(env) {
+    const s = await getSettings(env);
+    if (s.turnstileSiteKey && s.turnstileSecretKey) {
+        return { enabled: true, siteKey: s.turnstileSiteKey, secretKey: s.turnstileSecretKey, source: 'settings' };
+    }
+    if (env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY) {
+        return { enabled: true, siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY, source: 'env' };
+    }
+    return { enabled: false, siteKey: null, secretKey: null, source: 'none' };
+}
+
+// Secret 永不回显：只返回掩码，前端拿它当 placeholder 提示
+function maskSecret(v) {
+    if (!v) return '';
+    if (v.length <= 12) return v.slice(0, 3) + '••••••••';
+    return v.slice(0, 6) + '••••••••' + v.slice(-4);
+}
+
+// 统一的「当前状态视图」，GET / POST 返回同一形状，前端无需分支处理
+async function buildTurnstileView(env) {
+    const s = await getSettings(env);
+    const ts = await resolveTurnstile(env);
+    return {
+        siteKey: s.turnstileSiteKey || '',
+        siteKeySet: Boolean(s.turnstileSiteKey),
+        secretSet: Boolean(s.turnstileSecretKey),
+        secretMasked: maskSecret(s.turnstileSecretKey),
+        enabled: ts.enabled,
+        source: ts.source
+    };
+}
+
+// --- 管理员判定 ---
+async function getAdminName(env) {
+    const rec = await r2Get(env, ADMIN_KEY);
+    if (rec && rec.username) return rec.username;
+
+    // 惰性补录：已有用户但没有 admin 记录时，把最早注册的用户设为管理员
+    try {
+        const list = await env.DB.list({ prefix: PREFIX_USER });
+        const objs = (list.objects || []).slice(0, 50);
+        if (objs.length === 0) return null;
+
+        let earliest = null;
+        for (const obj of objs) {
+            const p = await r2Get(env, obj.key);
+            if (!p || !p.username) continue;
+            if (!earliest || (p.created_at || 0) < (earliest.created_at || 0)) {
+                earliest = { username: p.username, created_at: p.created_at || 0 };
+            }
+        }
+        if (!earliest) return null;
+
+        await r2Put(env, ADMIN_KEY, { username: earliest.username, created_at: earliest.created_at, backfilled: true });
+        return earliest.username;
+    } catch (e) {
+        console.error('admin backfill failed', e);
+        return null;
+    }
+}
+
+async function requireAdmin(env, user) {
+    const adminName = await getAdminName(env);
+    return adminName !== null && adminName === user;
+}
+
 async function getCurrentUser(request, env) {
     const cookie = request.headers.get('Cookie');
     if (!cookie) return null;
@@ -251,8 +356,8 @@ async function getCurrentUser(request, env) {
 
 // --- 业务逻辑 (多用户数据操作) ---
 
-function jsonResponse(data) {
-    return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } });
+function jsonResponse(data, status = 200) {
+    return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 async function getUserData(env, username) {
@@ -289,7 +394,7 @@ function getBjTimeFilename() {
 
 // --- 路由功能处理 ---
 
-async function handleRegister(request, env) {
+async function handleRegister(request, env, ts) {
     const formData = await request.formData();
     const username = formData.get('username').trim().toLowerCase();
     const password = formData.get('password');
@@ -299,13 +404,13 @@ async function handleRegister(request, env) {
 
     if (!username || !password || !question || !answer) return new Response('信息不完整', { status: 400 });
 
-    if (!(await verifyTurnstileToken(env.TURNSTILE_SECRET_KEY, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
-        return new Response(renderRegisterPage(true, '人机验证失败', env.TURNSTILE_SITE_KEY), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+    if (!(await verifyTurnstileToken(ts.secretKey, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
+        return new Response(renderRegisterPage(true, '人机验证失败', ts.siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
     }
 
     const existing = await env.DB.get(PREFIX_USER + username);
     if (existing) {
-        return new Response(renderRegisterPage(true, '该用户名/邮箱已被注册', env.TURNSTILE_SITE_KEY), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+        return new Response(renderRegisterPage(true, '该用户名/邮箱已被注册', ts.siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
     }
 
     const userProfile = {
@@ -318,18 +423,21 @@ async function handleRegister(request, env) {
     await r2Put(env, PREFIX_USER + username, userProfile);
     await r2Put(env, PREFIX_DATA + username, { accounts: [] });
 
+    // 第一个注册的用户自动成为管理员（只有管理员能改系统设置）
+    const existingAdmin = await r2Get(env, ADMIN_KEY);
+    if (!existingAdmin) {
+        await r2Put(env, ADMIN_KEY, { username, created_at: userProfile.created_at, backfilled: false });
+    }
+
     return new Response(null, { status: 302, headers: { 'Location': '/login?registered=1' } });
 }
 
-async function handleLogin(request, env) {
-  const siteKey = env.TURNSTILE_SITE_KEY;
-  const secretKey = env.TURNSTILE_SECRET_KEY;
+async function handleLogin(request, env, ts) {
+  // 成对才启用：resolveTurnstile 已保证 siteKey / secretKey 要么都有、要么都没有。
+  // 因此「只配了一半」不会再返回 500 把管理员锁在门外，只会静默关闭验证。
+  const siteKey = ts.siteKey;
+  const secretKey = ts.secretKey;
   
-  // [安全修复] Fail-Secure 配置检查
-  if (siteKey && !secretKey) {
-      return new Response('Server Configuration Error: Missing Turnstile Secret Key', { status: 500 });
-  }
-
   await new Promise(r => setTimeout(r, 2000)); // 基础防爆破延时
 
   const formData = await request.formData();
@@ -380,11 +488,11 @@ async function handleLogin(request, env) {
   });
 }
 
-async function handleForgotPassword(request, env) {
+async function handleForgotPassword(request, env, ts) {
     const formData = await request.formData();
     const step = formData.get('step');
     const username = (formData.get('username') || '').trim().toLowerCase();
-    const siteKey = env.TURNSTILE_SITE_KEY;
+    const siteKey = ts.siteKey;
     const turnstileToken = formData.get('cf-turnstile-response');
 
     if (step === '1') {
@@ -396,7 +504,7 @@ async function handleForgotPassword(request, env) {
     } 
     
     if (step === '2') {
-        if (!(await verifyTurnstileToken(env.TURNSTILE_SECRET_KEY, turnstileToken, request.headers.get('CF-Connecting-IP')))) return new Response('人机验证失败', {status: 400});
+        if (!(await verifyTurnstileToken(ts.secretKey, turnstileToken, request.headers.get('CF-Connecting-IP')))) return new Response('人机验证失败', {status: 400});
 
         const answer = formData.get('answer');
         const newPassword = formData.get('new_password');
@@ -431,7 +539,11 @@ async function handleLogout(request, env) {
 
 async function handleDashboard(env, username) {
   const data = await getUserData(env, username);
-  return new Response(renderDashboard(username, data.accounts), { 
+  const [adminName, turnstileView] = await Promise.all([getAdminName(env), buildTurnstileView(env)]);
+  return new Response(renderDashboard(username, data.accounts, {
+      isAdmin: adminName !== null && adminName === username,
+      turnstile: turnstileView
+  }), { 
       headers: { 
           'Content-Type': 'text/html;charset=UTF-8',
           // [安全增强] 添加基础安全头
@@ -439,6 +551,40 @@ async function handleDashboard(env, username) {
           'X-Content-Type-Options': 'nosniff'
       } 
   });
+}
+
+// --- 系统设置接口：人机验证密钥（仅管理员）---
+
+// GET 只返回掩码 + 是否已配置，Secret 永不回显
+async function handleGetTurnstileSettings(env, user) {
+    if (!(await requireAdmin(env, user))) return jsonResponse({ error: 'forbidden' }, 403);
+    return jsonResponse(await buildTurnstileView(env));
+}
+
+// POST 语义：字段不传 = 不修改；显式传空串 = 清空
+async function handleSaveTurnstileSettings(request, env, user) {
+    if (!(await requireAdmin(env, user))) return jsonResponse({ error: 'forbidden' }, 403);
+
+    const formData = await request.formData();
+    const s = await getSettings(env);
+
+    const nextSiteKey = formData.has('site_key') ? String(formData.get('site_key')).trim() : s.turnstileSiteKey;
+    const nextSecret  = formData.has('secret_key') ? String(formData.get('secret_key')).trim() : s.turnstileSecretKey;
+
+    if (nextSiteKey.length > 128 || nextSecret.length > 256) {
+        return new Response('密钥长度超出限制', { status: 400 });
+    }
+
+    // 成对校验：只填一半直接拒绝。否则用户会以为配好了，实际验证码永远过不去。
+    if (Boolean(nextSiteKey) !== Boolean(nextSecret)) {
+        return new Response('Site Key 与 Secret Key 必须成对配置（或同时留空以关闭验证）', { status: 400 });
+    }
+
+    s.turnstileSiteKey = nextSiteKey;
+    s.turnstileSecretKey = nextSecret;
+    await saveSettings(env, s);
+
+    return jsonResponse(await buildTurnstileView(env));
 }
 
 async function handleAddAccount(request, env, username) {
@@ -633,6 +779,14 @@ const commonHead = `
   .settings-section { margin-bottom: 20px; }
   .settings-title { font-size: 0.9rem; font-weight: 600; color: var(--text-sub); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
   .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* 人机验证设置 */
+  .ts-status { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; font-weight: 600; padding: 10px 12px; border-radius: 10px; margin-bottom: 15px; border: 1px solid var(--border); background: var(--bg); }
+  .ts-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .ts-msg { font-size: 0.85rem; margin-bottom: 10px; line-height: 1.4; }
+  .ts-msg.error { color: var(--danger); }
+  .ts-msg.ok { color: #10b981; }
+  .ts-badge { font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 6px; background: var(--primary); color: #fff; margin-left: 4px; vertical-align: middle; }
 
   /* 适配新的登录/注册样式 */
   .auth-container { width: 100%; max-width: 400px; animation: slideUp 0.4s ease-out; margin: auto;}
@@ -836,9 +990,13 @@ async function renderForgotPage(env, step, username, msg, siteKey, questionText)
   </body></html>`, { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
 }
 
-function renderDashboard(username, accounts) {
+function renderDashboard(username, accounts, opts) {
+  const o = opts || {};
+  const isAdmin = Boolean(o.isAdmin);
+  const tv = o.turnstile || { siteKey: '', siteKeySet: false, secretSet: false, secretMasked: '', enabled: false, source: 'none' };
   const safeUsername = escapeHtml(username);
   const accountsJson = JSON.stringify(accounts || []).replace(/</g, '\\u003c');
+  const tvJson = JSON.stringify(tv).replace(/</g, '\\u003c');
 
   return `<!DOCTYPE html><html><head><title>Authenticator</title>${commonHead}</head><body>
     <div id="toast" class="toast"></div>
@@ -854,7 +1012,7 @@ function renderDashboard(username, accounts) {
       
       <div id="settingsModal" class="modal">
          <div class="card" style="width:100%; max-width:340px; margin:0;">
-             <h2>⚙️ 数据管理</h2>
+             <h2>⚙️ 设置</h2>
              
              <div class="settings-section">
                 <div class="settings-title">数据备份</div>
@@ -863,6 +1021,13 @@ function renderDashboard(username, accounts) {
                     <button onclick="openBackupModal()" class="btn btn-outline btn-block">🕒 备份历史</button>
                 </div>
              </div>
+
+             ${isAdmin ? `
+             <div class="settings-section">
+                <div class="settings-title">系统设置 <span class="ts-badge">管理员</span></div>
+                <button onclick="openTurnstileModal()" class="btn btn-outline btn-block">🛡️ 人机验证 (Turnstile)</button>
+             </div>
+             ` : ''}
 
              <div class="settings-section" style="margin-bottom:0">
                 <div class="settings-title">灾难恢复</div>
@@ -964,8 +1129,38 @@ function renderDashboard(username, accounts) {
       </div>
     </div>
 
+    ${isAdmin ? `
+    <div id="turnstileModal" class="modal">
+      <div class="card" style="width:100%; max-width:360px; margin:0; max-height:88vh; overflow-y:auto;">
+        <h2>🛡️ 人机验证</h2>
+        <p class="text-sub text-center" style="margin-bottom:15px;">Cloudflare Turnstile 密钥，直接保存在 R2 中，无需再登录控制台配环境变量</p>
+
+        <div id="tsStatus" class="ts-status"></div>
+
+        <label class="text-sub">Site Key（公开值）</label>
+        <input type="text" id="tsSiteKey" placeholder="0x4AAAAAAA..." autocomplete="off" spellcheck="false">
+
+        <label class="text-sub">Secret Key（密钥，不会回显）</label>
+        <input type="password" id="tsSecretKey" placeholder="留空则不修改" autocomplete="new-password" spellcheck="false">
+
+        <div id="tsMsg" class="ts-msg"></div>
+
+        <div class="flex-gap mt-4">
+          <button type="button" class="btn btn-outline" onclick="backToSettings()">返回</button>
+          <button type="button" class="btn" id="tsSaveBtn" onclick="saveTurnstile()">保存</button>
+        </div>
+        <div class="mt-4">
+          <button type="button" class="btn btn-outline btn-block" id="tsClearBtn" onclick="clearTurnstile()" style="color:var(--danger); border-color:var(--danger);">清空密钥（关闭验证）</button>
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
     <script>
       const accounts = ${accountsJson};
+      // 人机验证当前状态（Secret 只有掩码，永不回显）
+      const TV = ${tvJson};
+      const IS_ADMIN = ${isAdmin ? 'true' : 'false'};
       
       function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
       function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
@@ -973,7 +1168,132 @@ function renderDashboard(username, accounts) {
       function backToSettings() {
           document.getElementById('backupModal').classList.remove('open');
           document.getElementById('restoreModal').classList.remove('open');
+          const tsm = document.getElementById('turnstileModal');
+          if (tsm) tsm.classList.remove('open');
           openSettings();
+      }
+
+      // --- 人机验证设置（仅管理员）---
+      let tsClearArmed = false;
+      let tsClearTimer = null;
+
+      function tsSetMsg(text, kind) {
+          const el = document.getElementById('tsMsg');
+          if (!el) return;
+          el.textContent = text || '';
+          el.className = 'ts-msg' + (kind ? ' ' + kind : '');
+      }
+
+      function tsRenderStatus() {
+          const box = document.getElementById('tsStatus');
+          if (!box) return;
+          let color, text;
+          if (TV.enabled && TV.source === 'settings') {
+              color = '#10b981'; text = '已启用（来自应用内设置）';
+          } else if (TV.enabled && TV.source === 'env') {
+              color = '#f59e0b'; text = '已启用（来自环境变量，应用内尚未配置）';
+          } else {
+              color = '#9ca3af'; text = '未启用 — 登录与注册页不会显示验证码';
+          }
+          box.innerHTML = '<span class="ts-dot"></span><span></span>';
+          box.firstChild.style.background = color;
+          box.lastChild.textContent = text;
+      }
+
+      function tsRefreshSecretHint() {
+          const el = document.getElementById('tsSecretKey');
+          if (!el) return;
+          el.value = '';
+          el.placeholder = TV.secretSet
+              ? ('已配置：' + TV.secretMasked + '（留空则不修改）')
+              : '尚未配置';
+      }
+
+      function tsDisarmClear() {
+          tsClearArmed = false;
+          if (tsClearTimer) { clearTimeout(tsClearTimer); tsClearTimer = null; }
+          const b = document.getElementById('tsClearBtn');
+          if (!b) return;
+          b.textContent = '清空密钥（关闭验证）';
+          b.style.background = 'transparent';
+          b.style.color = 'var(--danger)';
+      }
+
+      function openTurnstileModal() {
+          if (!IS_ADMIN) return;
+          closeSettings();
+          document.getElementById('tsSiteKey').value = TV.siteKey || '';
+          tsRefreshSecretHint();
+          tsSetMsg('');
+          tsDisarmClear();
+          tsRenderStatus();
+          document.getElementById('turnstileModal').classList.add('open');
+      }
+
+      function tsApplyView(view) {
+          TV.siteKey = view.siteKey || '';
+          TV.siteKeySet = !!view.siteKeySet;
+          TV.secretSet = !!view.secretSet;
+          TV.secretMasked = view.secretMasked || '';
+          TV.enabled = !!view.enabled;
+          TV.source = view.source;
+      }
+
+      // secretKey 传 null 表示「不修改」（不发送该字段），传空串表示「清空」
+      async function tsPost(siteKey, secretKey) {
+          const body = new FormData();
+          body.append('site_key', siteKey);
+          if (secretKey !== null) body.append('secret_key', secretKey);
+          const res = await fetch('/settings/turnstile', { method: 'POST', body: body });
+          if (res.status === 403) throw new Error('只有管理员可以修改系统设置');
+          if (res.status === 401) throw new Error('登录已过期，请重新登录');
+          if (!res.ok) throw new Error((await res.text()) || '保存失败');
+          return await res.json();
+      }
+
+      async function saveTurnstile() {
+          const btn = document.getElementById('tsSaveBtn');
+          const siteKey = document.getElementById('tsSiteKey').value.trim();
+          const secretRaw = document.getElementById('tsSecretKey').value.trim();
+          btn.classList.add('loading');
+          tsSetMsg('');
+          try {
+              const view = await tsPost(siteKey, secretRaw === '' ? null : secretRaw);
+              tsApplyView(view);
+              document.getElementById('tsSiteKey').value = TV.siteKey;
+              tsRefreshSecretHint();
+              tsRenderStatus();
+              tsSetMsg('已保存。密钥是服务端渲染进登录/注册页的，下次打开这些页面时生效。', 'ok');
+          } catch (e) {
+              tsSetMsg(e.message, 'error');
+          } finally {
+              btn.classList.remove('loading');
+          }
+      }
+
+      async function clearTurnstile() {
+          const btn = document.getElementById('tsClearBtn');
+          // 危险操作二次确认：4 秒后自动复位
+          if (!tsClearArmed) {
+              tsClearArmed = true;
+              btn.textContent = '再点一次确认清空';
+              btn.style.background = 'var(--danger)';
+              btn.style.color = '#fff';
+              tsClearTimer = setTimeout(tsDisarmClear, 4000);
+              return;
+          }
+          tsDisarmClear();
+          tsSetMsg('');
+          try {
+              const view = await tsPost('', '');
+              tsApplyView(view);
+              document.getElementById('tsSiteKey').value = '';
+              tsRefreshSecretHint();
+              tsRenderStatus();
+              tsSetMsg('已清空，人机验证已关闭。', 'ok');
+          } catch (e) {
+              tsSetMsg(e.message, 'error');
+          }
       }
 
       function openAddModal() { document.getElementById('addModal').classList.add('open'); }

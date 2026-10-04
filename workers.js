@@ -48,10 +48,11 @@ export default {
                        Array.isArray(config.sessions) && 
                        config.sessions.some(s => s.token === currentToken);
 
-    // 传递 Site Key 到登录页渲染函数
-    const siteKey = env.TURNSTILE_SITE_KEY || null;
+    // 人机验证配置：优先应用内设置（存 R2），其次环境变量，两者都没有则自动关闭
+    const ts = await resolveTurnstile(env);
+    const siteKey = ts.siteKey;
 
-    if (path === '/login' && request.method === 'POST') return await handleLogin(request, env, config);
+    if (path === '/login' && request.method === 'POST') return await handleLogin(request, env, config, ts);
     if (path === '/logout') return logoutResponse();
 
     if (!isLoggedIn) {
@@ -67,6 +68,10 @@ export default {
     if (path === '/backup') return await handleDownloadBackup(request, env);
     if (path === '/backups/list') return await handleListBackups(env);
     if (path === '/restore' && request.method === 'POST') return await handleRestore(request, env);
+
+    // 应用内设置：人机验证密钥（免去登录 Cloudflare 控制台配置环境变量）
+    if (path === '/settings/turnstile' && request.method === 'GET') return await handleGetTurnstileSettings(env);
+    if (path === '/settings/turnstile' && request.method === 'POST') return await handleSaveTurnstileSettings(request, env);
 
     return new Response('Not Found', { status: 404 });
   }
@@ -128,15 +133,21 @@ function handleServiceWorker() {
         self.clients.claim();
     });
 
+    // [安全修复] 白名单：只有这里列出的静态资源才允许被缓存
+    const STATIC_ASSET_PATHS = ['/app-icon.svg', '/manifest.json'];
+
     self.addEventListener('fetch', event => {
         if (event.request.method !== 'GET') return;
-        
+
         const url = new URL(event.request.url);
-        
-        // [安全修复] 明确排除根路径和任何非静态资源
-        if (url.pathname === '/' || url.pathname.startsWith('/api')) {
-             return; 
-        }
+
+        // [安全修复] 改为白名单策略。原实现只排除 '/' 和 '/api'，
+        // 而本应用的数据接口并不在 /api 下（/backups/list、/backup 等），
+        // 它们的响应会被写进 Cache，导致同一设备换账号后读到上一个人的
+        // 备份列表 / 备份文件（隐私泄漏）。白名单之外一律不拦截、不缓存。
+        const isSameOriginStatic = url.origin === self.location.origin && STATIC_ASSET_PATHS.indexOf(url.pathname) !== -1;
+        const isCdnStatic = url.hostname === 'cdn.jsdelivr.net';
+        if (!isSameOriginStatic && !isCdnStatic) return;
 
         event.respondWith(
             caches.match(event.request)
@@ -198,6 +209,57 @@ async function verifyTurnstileToken(secret, token, ip) {
     return outcome.success;
 }
 
+// --- 应用内设置：人机验证密钥（存 R2，部署后无需再登录 Cloudflare 控制台）---
+const SETTINGS_KEY = 'sys/settings.json';
+const DEFAULT_SETTINGS = { turnstileSiteKey: '', turnstileSecretKey: '' };
+
+async function getSettings(env) {
+    const obj = await env.DB.get(SETTINGS_KEY);
+    const data = obj ? await obj.json() : null;
+    return Object.assign({}, DEFAULT_SETTINGS, data || {});
+}
+
+async function saveSettings(env, settings) {
+    await env.DB.put(SETTINGS_KEY, JSON.stringify(settings), {
+        httpMetadata: { contentType: 'application/json' }
+    });
+}
+
+// [设计] 不引入额外的 enabled 开关字段 —— 两个密钥都填了就算启用，
+// 少一个状态就少一类 bug（不会出现「开关是开的但密钥是空的」这种矛盾态）。
+// 优先级：应用内设置 > 环境变量。保留 env 回退，方便随时切回控制台配置。
+async function resolveTurnstile(env) {
+    const s = await getSettings(env);
+    if (s.turnstileSiteKey && s.turnstileSecretKey) {
+        return { enabled: true, siteKey: s.turnstileSiteKey, secretKey: s.turnstileSecretKey, source: 'settings' };
+    }
+    if (env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY) {
+        return { enabled: true, siteKey: env.TURNSTILE_SITE_KEY, secretKey: env.TURNSTILE_SECRET_KEY, source: 'env' };
+    }
+    return { enabled: false, siteKey: null, secretKey: null, source: 'none' };
+}
+
+// Secret 永不回显：只返回掩码，前端拿它当 placeholder 提示
+function maskSecret(v) {
+    if (!v) return '';
+    if (v.length <= 12) return v.slice(0, 3) + '••••••••';
+    return v.slice(0, 6) + '••••••••' + v.slice(-4);
+}
+
+// 统一的「当前状态视图」，GET / POST 返回同一形状，前端无需分支处理
+async function buildTurnstileView(env) {
+    const s = await getSettings(env);
+    const ts = await resolveTurnstile(env);
+    return {
+        siteKey: s.turnstileSiteKey || '',
+        siteKeySet: Boolean(s.turnstileSiteKey),
+        secretSet: Boolean(s.turnstileSecretKey),
+        secretMasked: maskSecret(s.turnstileSecretKey),
+        enabled: ts.enabled,
+        source: ts.source
+    };
+}
+
 // [核心保存函数]
 // needBackup: true (默认) = 触发历史备份
 // needBackup: false = 仅保存当前状态，不备份 (用于登录)
@@ -241,8 +303,8 @@ function logoutResponse() {
     });
 }
 
-function jsonResponse(data) {
-    return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } });
+function jsonResponse(data, status = 200) {
+    return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 async function handleSetup(request, env) {
@@ -265,14 +327,11 @@ async function handleSetup(request, env) {
   return new Response(null, { status: 302, headers: { 'Location': '/' } });
 }
 
-async function handleLogin(request, env, config) {
-  const siteKey = env.TURNSTILE_SITE_KEY;
-  const secretKey = env.TURNSTILE_SECRET_KEY;
-  
-  // [安全修复] Fail-Secure 配置检查
-  if (siteKey && !secretKey) {
-      return new Response('Server Configuration Error: Missing Turnstile Secret Key', { status: 500 });
-  }
+async function handleLogin(request, env, config, ts) {
+  // 成对才启用：resolveTurnstile 已保证 siteKey / secretKey 要么都有、要么都没有。
+  // 因此「只配了一半」不会再返回 500 把管理员锁在门外，只会静默关闭验证。
+  const siteKey = ts.siteKey;
+  const secretKey = ts.secretKey;
 
   await new Promise(r => setTimeout(r, 2000)); // 基础防爆破延时
   
@@ -345,7 +404,8 @@ async function handleLogin(request, env, config) {
 }
 
 async function handleDashboard(env, config) {
-  return new Response(renderDashboard(config.username, config.accounts), { 
+  const turnstileView = await buildTurnstileView(env);
+  return new Response(renderDashboard(config.username, config.accounts, turnstileView), { 
       headers: { 
           'Content-Type': 'text/html;charset=UTF-8',
           // [安全增强] 添加基础安全头
@@ -353,6 +413,37 @@ async function handleDashboard(env, config) {
           'X-Content-Type-Options': 'nosniff'
       } 
   });
+}
+
+// --- 应用内设置接口：人机验证密钥 ---
+
+// GET 只返回掩码 + 是否已配置，Secret 永不回显
+async function handleGetTurnstileSettings(env) {
+    return jsonResponse(await buildTurnstileView(env));
+}
+
+// POST 语义：字段不传 = 不修改；显式传空串 = 清空
+async function handleSaveTurnstileSettings(request, env) {
+    const formData = await request.formData();
+    const s = await getSettings(env);
+
+    const nextSiteKey = formData.has('site_key') ? String(formData.get('site_key')).trim() : s.turnstileSiteKey;
+    const nextSecret  = formData.has('secret_key') ? String(formData.get('secret_key')).trim() : s.turnstileSecretKey;
+
+    if (nextSiteKey.length > 128 || nextSecret.length > 256) {
+        return new Response('密钥长度超出限制', { status: 400 });
+    }
+
+    // 成对校验：只填一半直接拒绝。否则用户会以为配好了，实际验证码永远过不去。
+    if (Boolean(nextSiteKey) !== Boolean(nextSecret)) {
+        return new Response('Site Key 与 Secret Key 必须成对配置（或同时留空以关闭验证）', { status: 400 });
+    }
+
+    s.turnstileSiteKey = nextSiteKey;
+    s.turnstileSecretKey = nextSecret;
+    await saveSettings(env, s);
+
+    return jsonResponse(await buildTurnstileView(env));
 }
 
 async function handleAddAccount(request, env, config) {
@@ -535,6 +626,13 @@ const commonHead = `
   .settings-section { margin-bottom: 20px; }
   .settings-title { font-size: 0.9rem; font-weight: 600; color: var(--text-sub); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
   .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* 人机验证设置 */
+  .ts-status { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; font-weight: 600; padding: 10px 12px; border-radius: 10px; margin-bottom: 15px; border: 1px solid var(--border); background: var(--bg); }
+  .ts-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .ts-msg { font-size: 0.85rem; margin-bottom: 10px; line-height: 1.4; }
+  .ts-msg.error { color: var(--danger); }
+  .ts-msg.ok { color: #10b981; }
 </style>
 <script>
   function initTheme() {
@@ -642,12 +740,14 @@ function renderLoginPage(isError, msg, siteKey) {
   </body></html>`;
 }
 
-function renderDashboard(username, accounts) {
+function renderDashboard(username, accounts, turnstileView) {
   // [安全修复] 后端转义用户名，防止 XSS
   const safeUsername = escapeHtml(username);
   
   // [安全修复] 在注入 JSON 到 script 标签时，防止 </script> 闭合标签逃逸攻击
   const accountsJson = JSON.stringify(accounts || []).replace(/</g, '\\u003c');
+  const tv = turnstileView || { siteKey: '', siteKeySet: false, secretSet: false, secretMasked: '', enabled: false, source: 'none' };
+  const tvJson = JSON.stringify(tv).replace(/</g, '\\u003c');
 
   return `<!DOCTYPE html><html><head><title>Authenticator</title>${commonHead}</head><body>
     <div id="toast" class="toast"></div>
@@ -663,7 +763,7 @@ function renderDashboard(username, accounts) {
       
       <div id="settingsModal" class="modal">
          <div class="card" style="width:100%; max-width:340px; margin:0;">
-             <h2>⚙️ 数据管理</h2>
+             <h2>⚙️ 设置</h2>
              
              <div class="settings-section">
                 <div class="settings-title">数据备份</div>
@@ -671,6 +771,11 @@ function renderDashboard(username, accounts) {
                     <a href="/backup" class="btn btn-outline btn-block">⬇️ 下载当前</a>
                     <button onclick="openBackupModal()" class="btn btn-outline btn-block">🕒 备份历史</button>
                 </div>
+             </div>
+
+             <div class="settings-section">
+                <div class="settings-title">安全设置</div>
+                <button onclick="openTurnstileModal()" class="btn btn-outline btn-block">🛡️ 人机验证 (Turnstile)</button>
              </div>
 
              <div class="settings-section" style="margin-bottom:0">
@@ -773,9 +878,36 @@ function renderDashboard(username, accounts) {
       </div>
     </div>
 
+    <div id="turnstileModal" class="modal">
+      <div class="card" style="width:100%; max-width:360px; margin:0; max-height:88vh; overflow-y:auto;">
+        <h2>🛡️ 人机验证</h2>
+        <p class="text-sub text-center" style="margin-bottom:15px;">Cloudflare Turnstile 密钥，直接保存在 R2 中，无需再登录控制台配环境变量</p>
+
+        <div id="tsStatus" class="ts-status"></div>
+
+        <label class="text-sub">Site Key（公开值）</label>
+        <input type="text" id="tsSiteKey" placeholder="0x4AAAAAAA..." autocomplete="off" spellcheck="false">
+
+        <label class="text-sub">Secret Key（密钥，不会回显）</label>
+        <input type="password" id="tsSecretKey" placeholder="留空则不修改" autocomplete="new-password" spellcheck="false">
+
+        <div id="tsMsg" class="ts-msg"></div>
+
+        <div class="flex-gap mt-4">
+          <button type="button" class="btn btn-outline" onclick="backToSettings()">返回</button>
+          <button type="button" class="btn" id="tsSaveBtn" onclick="saveTurnstile()">保存</button>
+        </div>
+        <div class="mt-4">
+          <button type="button" class="btn btn-outline btn-block" id="tsClearBtn" onclick="clearTurnstile()" style="color:var(--danger); border-color:var(--danger);">清空密钥（关闭验证）</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       // JSON 数据已在后端进行转义处理
       const accounts = ${accountsJson};
+      // 人机验证当前状态（Secret 只有掩码，永不回显）
+      const TV = ${tvJson};
       
       // 设置中心逻辑
       function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
@@ -784,7 +916,124 @@ function renderDashboard(username, accounts) {
       function backToSettings() {
           document.getElementById('backupModal').classList.remove('open');
           document.getElementById('restoreModal').classList.remove('open');
+          document.getElementById('turnstileModal').classList.remove('open');
           openSettings();
+      }
+
+      // --- 人机验证设置 ---
+      let tsClearArmed = false;
+      let tsClearTimer = null;
+
+      function tsSetMsg(text, kind) {
+          const el = document.getElementById('tsMsg');
+          el.textContent = text || '';
+          el.className = 'ts-msg' + (kind ? ' ' + kind : '');
+      }
+
+      function tsRenderStatus() {
+          const box = document.getElementById('tsStatus');
+          let color, text;
+          if (TV.enabled && TV.source === 'settings') {
+              color = '#10b981'; text = '已启用（来自应用内设置）';
+          } else if (TV.enabled && TV.source === 'env') {
+              color = '#f59e0b'; text = '已启用（来自环境变量，应用内尚未配置）';
+          } else {
+              color = '#9ca3af'; text = '未启用 — 登录页不会显示验证码';
+          }
+          box.innerHTML = '<span class="ts-dot"></span><span></span>';
+          box.firstChild.style.background = color;
+          box.lastChild.textContent = text;
+      }
+
+      function tsRefreshSecretHint() {
+          const el = document.getElementById('tsSecretKey');
+          el.value = '';
+          el.placeholder = TV.secretSet
+              ? ('已配置：' + TV.secretMasked + '（留空则不修改）')
+              : '尚未配置';
+      }
+
+      function tsDisarmClear() {
+          tsClearArmed = false;
+          if (tsClearTimer) { clearTimeout(tsClearTimer); tsClearTimer = null; }
+          const b = document.getElementById('tsClearBtn');
+          b.textContent = '清空密钥（关闭验证）';
+          b.style.background = 'transparent';
+          b.style.color = 'var(--danger)';
+      }
+
+      function openTurnstileModal() {
+          closeSettings();
+          document.getElementById('tsSiteKey').value = TV.siteKey || '';
+          tsRefreshSecretHint();
+          tsSetMsg('');
+          tsDisarmClear();
+          tsRenderStatus();
+          document.getElementById('turnstileModal').classList.add('open');
+      }
+
+      function tsApplyView(view) {
+          TV.siteKey = view.siteKey || '';
+          TV.siteKeySet = !!view.siteKeySet;
+          TV.secretSet = !!view.secretSet;
+          TV.secretMasked = view.secretMasked || '';
+          TV.enabled = !!view.enabled;
+          TV.source = view.source;
+      }
+
+      // secretKey 传 null 表示「不修改」（不发送该字段），传空串表示「清空」
+      async function tsPost(siteKey, secretKey) {
+          const body = new FormData();
+          body.append('site_key', siteKey);
+          if (secretKey !== null) body.append('secret_key', secretKey);
+          const res = await fetch('/settings/turnstile', { method: 'POST', body: body });
+          if (!res.ok) throw new Error((await res.text()) || '保存失败');
+          return await res.json();
+      }
+
+      async function saveTurnstile() {
+          const btn = document.getElementById('tsSaveBtn');
+          const siteKey = document.getElementById('tsSiteKey').value.trim();
+          const secretRaw = document.getElementById('tsSecretKey').value.trim();
+          btn.classList.add('loading');
+          tsSetMsg('');
+          try {
+              const view = await tsPost(siteKey, secretRaw === '' ? null : secretRaw);
+              tsApplyView(view);
+              document.getElementById('tsSiteKey').value = TV.siteKey;
+              tsRefreshSecretHint();
+              tsRenderStatus();
+              tsSetMsg('已保存。密钥是服务端渲染进登录页的，下次打开登录页生效。', 'ok');
+          } catch (e) {
+              tsSetMsg(e.message, 'error');
+          } finally {
+              btn.classList.remove('loading');
+          }
+      }
+
+      async function clearTurnstile() {
+          const btn = document.getElementById('tsClearBtn');
+          // 危险操作二次确认：4 秒后自动复位
+          if (!tsClearArmed) {
+              tsClearArmed = true;
+              btn.textContent = '再点一次确认清空';
+              btn.style.background = 'var(--danger)';
+              btn.style.color = '#fff';
+              tsClearTimer = setTimeout(tsDisarmClear, 4000);
+              return;
+          }
+          tsDisarmClear();
+          tsSetMsg('');
+          try {
+              const view = await tsPost('', '');
+              tsApplyView(view);
+              document.getElementById('tsSiteKey').value = '';
+              tsRefreshSecretHint();
+              tsRenderStatus();
+              tsSetMsg('已清空，人机验证已关闭。', 'ok');
+          } catch (e) {
+              tsSetMsg(e.message, 'error');
+          }
       }
 
       function openAddModal() { document.getElementById('addModal').classList.add('open'); }

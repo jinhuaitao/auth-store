@@ -1,0 +1,19 @@
+{
+  "name": "cloud-auth-worker",
+  "version": "1.1.2",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers 版 TOTP 验证器（个人版 / 多人版），R2 自动创建与自动绑定",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run",
+
+    "dev:multiplayer": "wrangler dev -c wrangler.multiplayer.jsonc",
+    "deploy:multiplayer": "wrangler deploy -c wrangler.multiplayer.jsonc",
+    "check:multiplayer": "wrangler deploy -c wrangler.multiplayer.jsonc --dry-run --outdir=.wrangler/dry-run-multi"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

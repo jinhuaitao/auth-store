@@ -1,0 +1,19 @@
+{
+  // Cloudflare Workers 配置 —— 多人版（多账号注册）
+  // 入口文件：Multiplayer.js
+  //
+  // 与个人版唯一的区别：main 指向 Multiplayer.js，且 name 不同。
+  // name 不同 → 自动创建出来的 R2 是两套独立资源，个人版和多人版的数据天然隔离，
+  // 可以同时部署、互不影响。
+
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  "name": "auth-store-multiplayer",
+  "main": "Multiplayer.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // ⚠️ 同样不写 bucket_name —— 部署时自动创建 + 自动绑定
+  "r2_buckets": [{ "binding": "DB" }]
+}

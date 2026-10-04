@@ -1,0 +1,38 @@
+{
+  // Cloudflare Workers 配置 —— 个人版（单账号）
+  // 入口文件：workers.js
+  //
+  // 【自动创建 + 自动绑定 R2 的关键】
+  // 下面的 r2_buckets 故意「不写 bucket_name」。
+  // Cloudflare 的 Automatic Provisioning 规则：绑定里不写资源标识，部署时就会
+  // 自动创建资源并自动绑定，资源名以本文件的 "name" 作为前缀。
+  // 一旦手动补上 bucket_name，就变成「必须提前手工建桶」，自动供给失效。
+
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // 自动创建出来的 R2 桶会以这个名字为前缀，例如 auth-store-personal-<后缀>
+  // 注意：多人版（wrangler.multiplayer.jsonc）必须用不同的 name，
+  // 否则两套部署会共用同一套资源，数据互相覆盖。
+  "name": "auth-store-personal",
+  "main": "workers.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // R2 存储桶绑定：变量名 DB 与代码里的 env.DB 一一对应
+  // ⚠️ 不写 bucket_name —— 这就是「自动创建 + 自动绑定」的开关
+  "r2_buckets": [{ "binding": "DB" }]
+
+  // ── 环境变量 ──────────────────────────────────────────────
+  // 这里刻意不写 vars，原因：配置文件里出现过的变量会覆盖 Dashboard 上配好的同名变量，
+  // 写空值等于把用户已配置的值清空。
+  //
+  // TURNSTILE_SITE_KEY   ：公开值，可在 Dashboard → Settings → Variables 配置，
+  //                        或取消下面注释写死在这里。
+  // TURNSTILE_SECRET_KEY ：密钥，必须走 Dashboard → Settings → Variables and Secrets
+  //                        加密存储，或本地执行 npx wrangler secret put TURNSTILE_SECRET_KEY
+  //
+  // 两个都不配 = 自动关闭人机验证（旧版逻辑），不会报错。
+  //
+  // "vars": { "TURNSTILE_SITE_KEY": "0x4AAAAAAA..." }
+}
