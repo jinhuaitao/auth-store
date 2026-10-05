@@ -9,7 +9,7 @@ const PWA_VERSION = 'v1.1.3'; // 版本升级，配合登录页清理逻辑确�
 // 这些路径由前端 fetch() 调用并要求 JSON 响应。
 // 未登录时必须返回 401 JSON，绝不能 302 到登录页 HTML ——
 // 否则前端跟着重定向拿到 HTML，res.json() 会抛异常，界面只能显示「加载失败」。
-const API_PATHS = ['/backups/list', '/settings/turnstile'];
+const API_PATHS = ['/backups/list', '/settings/turnstile', '/settings/admin'];
 function isApiPath(path) { return API_PATHS.indexOf(path) !== -1; }
 
 // --- 多用户存储前缀 ---
@@ -93,6 +93,10 @@ export default {
     // 系统设置：人机验证密钥（仅管理员，免去登录 Cloudflare 控制台配环境变量）
     if (path === '/settings/turnstile' && request.method === 'GET') return await handleGetTurnstileSettings(env, user);
     if (path === '/settings/turnstile' && request.method === 'POST') return await handleSaveTurnstileSettings(request, env, user);
+
+    // 管理员转移（仅管理员）：把 sys/admin 指向另一个已注册用户
+    if (path === '/settings/admin' && request.method === 'GET') return await handleGetAdminInfo(env, user);
+    if (path === '/settings/admin' && request.method === 'POST') return await handleTransferAdmin(request, env, user);
 
     return new Response('Not Found', { status: 404 });
   }
@@ -591,6 +595,38 @@ async function handleSaveTurnstileSettings(request, env, user) {
     return jsonResponse(await buildTurnstileView(env));
 }
 
+// --- 系统设置接口：管理员转移（仅管理员）---
+
+async function handleGetAdminInfo(env, user) {
+    if (!(await requireAdmin(env, user))) return jsonResponse({ error: 'forbidden' }, 403);
+    return jsonResponse({ admin: await getAdminName(env) });
+}
+
+// 把 sys/admin 指向另一个已注册用户。转移不可逆：完成后原管理员立即失去权限。
+async function handleTransferAdmin(request, env, user) {
+    if (!(await requireAdmin(env, user))) return jsonResponse({ error: 'forbidden' }, 403);
+
+    const formData = await request.formData();
+    const target = String(formData.get('username') || '').trim().toLowerCase();
+
+    if (!target) return jsonResponse({ error: 'empty', message: '请输入要转移的用户名' }, 400);
+    if (target === user) return jsonResponse({ error: 'self', message: '你已经是管理员了' }, 400);
+
+    // 只能转给真实存在的用户，避免 sys/admin 指向一个登录不了的悬空账号
+    const profile = await r2Get(env, PREFIX_USER + target);
+    if (!profile || !profile.username) return jsonResponse({ error: 'not_found', message: '该用户不存在' }, 404);
+
+    await r2Put(env, ADMIN_KEY, {
+        username: target,
+        created_at: profile.created_at || Date.now(),
+        transferred: true,
+        transferredBy: user,
+        transferredAt: Date.now()
+    });
+
+    return jsonResponse({ ok: true, admin: target });
+}
+
 async function handleAddAccount(request, env, username) {
     const formData = await request.formData();
     let issuer = formData.get('issuer') || 'Unknown';
@@ -1039,6 +1075,7 @@ function renderDashboard(username, accounts, opts) {
              <div class="settings-section">
                 <div class="settings-title">系统设置 <span class="ts-badge">管理员</span></div>
                 <button onclick="openTurnstileModal()" class="btn btn-outline btn-block">🛡️ 人机验证 (Turnstile)</button>
+                <button onclick="openTransferModal()" class="btn btn-outline btn-block" style="margin-top:8px;">👑 转移管理员</button>
              </div>
              ` : ''}
 
@@ -1169,6 +1206,25 @@ function renderDashboard(username, accounts, opts) {
     </div>
     ` : ''}
 
+    ${isAdmin ? `
+    <div id="transferModal" class="modal">
+      <div class="card" style="width:100%; max-width:340px; margin:0;">
+        <h2>👑 转移管理员</h2>
+        <p class="text-sub text-center" style="margin-bottom:15px;">把管理员权限交给另一个已注册用户。转移后你将立即失去管理员权限，且无法自行改回。</p>
+
+        <label class="text-sub">新管理员用户名</label>
+        <input type="text" id="transferUser" placeholder="输入已注册的用户名" autocomplete="off" spellcheck="false">
+
+        <div id="transferMsg" class="ts-msg"></div>
+
+        <div class="flex-gap mt-4">
+          <button type="button" class="btn btn-outline" onclick="backToSettings()">取消</button>
+          <button type="button" class="btn btn-danger" id="transferBtn" onclick="doTransfer()">确认转移</button>
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
     <script>
       const accounts = ${accountsJson};
       // 人机验证当前状态（Secret 只有掩码，永不回显）
@@ -1183,6 +1239,8 @@ function renderDashboard(username, accounts, opts) {
           document.getElementById('restoreModal').classList.remove('open');
           const tsm = document.getElementById('turnstileModal');
           if (tsm) tsm.classList.remove('open');
+          const tfm = document.getElementById('transferModal');
+          if (tfm) tfm.classList.remove('open');
           openSettings();
       }
 
@@ -1306,6 +1364,66 @@ function renderDashboard(username, accounts, opts) {
               tsSetMsg('已清空，人机验证已关闭。', 'ok');
           } catch (e) {
               tsSetMsg(e.message, 'error');
+          }
+      }
+
+      // --- 管理员转移（仅管理员）---
+      let transferArmed = false;
+      let transferTimer = null;
+
+      function transferSetMsg(text, kind) {
+          const el = document.getElementById('transferMsg');
+          if (!el) return;
+          el.textContent = text || '';
+          el.className = 'ts-msg' + (kind ? ' ' + kind : '');
+      }
+
+      function transferDisarm() {
+          transferArmed = false;
+          if (transferTimer) { clearTimeout(transferTimer); transferTimer = null; }
+          const b = document.getElementById('transferBtn');
+          if (b) b.textContent = '确认转移';
+      }
+
+      function openTransferModal() {
+          if (!IS_ADMIN) return;
+          closeSettings();
+          const inp = document.getElementById('transferUser');
+          if (inp) inp.value = '';
+          transferSetMsg('');
+          transferDisarm();
+          document.getElementById('transferModal').classList.add('open');
+      }
+
+      async function doTransfer() {
+          const btn = document.getElementById('transferBtn');
+          const target = (document.getElementById('transferUser').value || '').trim().toLowerCase();
+          if (!target) { transferSetMsg('请输入用户名', 'error'); return; }
+
+          // 危险且不可逆：二次点击确认，4 秒后自动复位
+          if (!transferArmed) {
+              transferArmed = true;
+              btn.textContent = '再点一次确认转移';
+              transferTimer = setTimeout(transferDisarm, 4000);
+              return;
+          }
+          transferDisarm();
+          btn.classList.add('loading');
+          transferSetMsg('');
+          try {
+              const body = new FormData();
+              body.append('username', target);
+              const res = await fetch('/settings/admin', { method: 'POST', body: body, credentials: 'same-origin' });
+              let data = null;
+              try { data = await res.json(); } catch (e) {}
+              if (res.status === 403) throw new Error('只有管理员可以转移管理员');
+              if (res.status === 401) throw new Error('登录已过期，请重新登录');
+              if (!res.ok) throw new Error((data && data.message) || '转移失败');
+              transferSetMsg('已转移给 ' + target + '，正在刷新…', 'ok');
+              setTimeout(function () { location.reload(); }, 800);
+          } catch (e) {
+              transferSetMsg(e.message, 'error');
+              btn.classList.remove('loading');
           }
       }
 
