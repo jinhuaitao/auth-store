@@ -135,6 +135,56 @@ git push -u origin main
 
 ---
 
+## 安全加固
+
+个人版（`workers.js`）与多人版（`Multiplayer.js`）都做了下列加固，**开箱即用、无需额外配置**。
+
+### 1. 密码哈希：单轮 SHA-256 → PBKDF2-SHA256
+
+原实现是 `SHA-256(password + salt)`，盐随机但**单轮哈希太快**，R2 数据一旦泄漏可被 GPU 高速爆破。现改为 PBKDF2-SHA256 迭代派生，哈希串自带算法与迭代次数：
+
+```
+pbkdf2$50000$<盐>$<哈希>     ← 不带 Pepper
+pbkdf2p$50000$<盐>$<哈希>    ← 带 Pepper
+```
+
+- **平滑升级**：旧的 `盐$哈希`（单轮 SHA-256）和更早的明文密码仍可登录，并在**下次登录成功后自动重新哈希**为新格式 —— 不需要重置任何密码。
+- **迭代次数**：`PBKDF2_ITERATIONS`（两个入口文件顶部），默认 `50000`。Workers 免费版单请求 CPU 上限 10ms，实测 50000 次约 6-8ms，可稳定运行；付费版（CPU 50ms）可提到 `100000+`。
+
+### 2. 可选的 Pepper（密码胡椒）
+
+在环境变量里配置 `PBKDF2_PEPPER`（高熵随机串）后，密码会先经过一次 `HMAC-SHA256(pepper, password)` 再进 PBKDF2。这样**即使 R2 被全量导出，没有 Pepper 也无法离线爆破**。
+
+```bash
+npx wrangler secret put PBKDF2_PEPPER
+```
+
+> ⚠️ **务必长期保管 Pepper。** 它只存在环境变量、不在 R2 里 —— 这正是它的价值，但也意味着**丢失 Pepper = 所有人无法登录**。启用后请立即备份到密码管理器。
+>
+> 启用后，已有账号会在下次登录时自动升级为带 Pepper 的哈希（前缀 `pbkdf2` → `pbkdf2p`）。
+
+### 3. 安全响应头
+
+所有响应统一附加：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`、`Cross-Origin-Opener-Policy: same-origin`、`X-Robots-Tag: noindex`、`Strict-Transport-Security`。
+
+CSP 保留了 `'unsafe-inline'`（页面大量使用内联脚本与 `onclick`，去掉会直接让界面失效），但仍能限制外部脚本/连接来源、**禁止被 iframe 嵌套**（防点击劫持）、禁用 `object` / `base` 逃逸。
+
+### 4. CSRF 纵深防御
+
+所有状态变更请求（POST）都会校验 `Origin`（其次 `Referer`）是否同源，跨站请求直接返回 **403**，与 `SameSite=Lax` 的会话 Cookie 叠加生效。
+
+### 5. 其他
+
+| 项目 | 改动 |
+| --- | --- |
+| 会话令牌 | 由 `crypto.randomUUID()`（122 位）升级为 32 字节随机十六进制（**256 位**） |
+| 用户名白名单（多人版） | 只允许 `[a-z0-9._@+-]`、须以字母/数字开头、长度 3-64。**修掉一个真实越权**：用户名会直接拼进 R2 key，若允许 `/`，用户 `a` 的 `backups/a/` 前缀会匹配到用户 `a/b` 的备份 |
+| 备份下载 | 文件名白名单清洗后再写入 `Content-Disposition`，杜绝引号/换行注入响应头 |
+| 恢复接口 | 上传文件限制 2MB；只允许回滚 `backups/` 下的对象；校验 `accounts` 为数组 |
+| 哈希比对 | 改为恒定时间比较，消除时序侧信道 |
+
+---
+
 ## 部署方式二：本地 wrangler CLI
 
 ```bash

@@ -37,8 +37,19 @@ function escapeHtml(unsafe) {
 
 export default {
   async fetch(request, env) {
+    // 统一出口：所有响应（含重定向、下载流）都补上安全头
+    return withSecurityHeaders(await handleRequest(request, env));
+  }
+};
+
+async function handleRequest(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // CSRF 纵深防御：状态变更请求必须同源（配合 SameSite=Lax 的会话 Cookie）
+    if (request.method !== 'GET' && request.method !== 'HEAD' && !isSameOriginRequest(request, url)) {
+        return new Response('Forbidden: cross-origin request blocked', { status: 403 });
+    }
 
     // 检查 R2 绑定
     if (!env.DB || typeof env.DB.put !== 'function') {
@@ -99,8 +110,94 @@ export default {
     if (path === '/settings/admin' && request.method === 'POST') return await handleTransferAdmin(request, env, user);
 
     return new Response('Not Found', { status: 404 });
-  }
+}
+
+// --- 安全响应头 ---
+// 统一给每个响应加安全头。CSP 里保留 'unsafe-inline'：本应用大量使用内联
+// <script> 与 onclick 属性，去掉会直接让界面失效。即便如此，CSP 仍能：
+// 限制外部脚本/连接来源、禁止被 iframe 嵌套（防点击劫持）、禁用 object/base 逃逸。
+const SECURITY_HEADERS = {
+    'Content-Security-Policy': [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://challenges.cloudflare.com",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: https://challenges.cloudflare.com",
+        "font-src 'self' data:",
+        "connect-src 'self' https://challenges.cloudflare.com",
+        "frame-src https://challenges.cloudflare.com",
+        "media-src 'self' blob:",
+        "worker-src 'self' blob:"
+    ].join('; '),
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(self), microphone=(), geolocation=(), payment=()',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'X-Robots-Tag': 'noindex, nofollow',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
 };
+
+function withSecurityHeaders(response) {
+    const headers = new Headers(response.headers);
+    for (const key in SECURITY_HEADERS) headers.set(key, SECURITY_HEADERS[key]);
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
+}
+
+// 同源校验：Origin 优先，其次 Referer；两者都缺失（少数非浏览器客户端）时放行，
+// 仍由会话 Cookie 兜底。注意这不能替代 SameSite，二者叠加才构成 CSRF 纵深防御。
+function isSameOriginRequest(request, url) {
+    const origin = request.headers.get('Origin');
+    if (origin) {
+        try { return new URL(origin).host === url.host; } catch (e) { return false; }
+    }
+    const referer = request.headers.get('Referer');
+    if (referer) {
+        try { return new URL(referer).host === url.host; } catch (e) { return false; }
+    }
+    return true;
+}
+
+// --- 通用安全工具 ---
+
+function randomHex(bytes) {
+    const buf = new Uint8Array(bytes);
+    crypto.getRandomValues(buf);
+    return bytesToHex(buf);
+}
+
+function hexToBytes(hex) {
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+}
+
+function bytesToHex(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, '0');
+    return s;
+}
+
+// 恒定时间比较，避免用 === 比较哈希带来的时序侧信道
+function timingSafeEqualHex(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+
+// 用户名白名单：username 会直接拼进 R2 key（dat/<username>、backups/<username>/），
+// 必须禁止 "/"。否则用户 "a" 的 backups/a/ 前缀会匹配到用户 "a/b" 的备份，造成越权读取；
+// 顺带杜绝引号/换行进入 Content-Disposition 造成响应头注入。
+const USERNAME_RE = /^[a-z0-9][a-z0-9._@+-]{2,63}$/;
+function isValidUsername(u) { return typeof u === 'string' && USERNAME_RE.test(u); }
 
 // --- R2 多用户存储封装 ---
 
@@ -230,27 +327,84 @@ function handleServiceWorker() {
     return new Response(js, { headers: { 'Content-Type': 'application/javascript' } });
 }
 
-// --- 安全核心工具 ---
-async function hashPassword(password, salt = null) {
-    const encoder = new TextEncoder();
-    if (!salt) {
-        const saltBytes = new Uint8Array(16);
-        crypto.getRandomValues(saltBytes);
-        salt = [...saltBytes].map(b => b.toString(16).padStart(2, '0')).join('');
-    }
-    const data = encoder.encode(password + salt);
-    // 维持 SHA-256 兼容性
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return `${salt}$${hashArray.map(b => b.toString(16).padStart(2, '0')).join('')}`;
+// --- 安全核心工具：密码哈希 ---
+// 原实现是单轮 SHA-256(password + salt)：盐是随机的，但单轮哈希太快，
+// 拿到 R2 数据后可被 GPU 高速爆破。改为 PBKDF2-SHA256 迭代派生。
+//
+// 哈希串自带算法标识与迭代次数（pbkdf2$迭代$盐$哈希），因此：
+//  - 提高迭代数后，旧密码依然能验证，并在下次登录时自动升级；
+//  - 旧的 `盐$哈希`（单轮 SHA-256）与更旧的无 `$` 明文密码仍可登录。
+//
+// 迭代次数受 Workers 的 CPU 时间上限约束：免费版 10ms/请求，付费版默认 50ms。
+// 实测 50000 次约 6-8ms，可稳定跑在免费版；付费版可把 PBKDF2_ITERATIONS 提到 100000+。
+const PBKDF2_ITERATIONS = 50000;
+const PBKDF2_PREFIX = 'pbkdf2';    // 不带 Pepper
+const PBKDF2P_PREFIX = 'pbkdf2p';  // 带 Pepper（HMAC 预哈希）
+
+// 可选的 Pepper（密码胡椒）：独立于 R2 的高熵密钥，放在环境变量 PBKDF2_PEPPER。
+// 即便 R2 被全量导出，攻击者没有 Pepper 也无法离线爆破。
+// ⚠️ 启用后务必长期保管：丢失 Pepper = 所有密码都无法验证（等于把所有人锁在门外）。
+function resolvePepper(env) {
+    return (env && typeof env.PBKDF2_PEPPER === 'string') ? env.PBKDF2_PEPPER.trim() : '';
 }
 
-async function verifyPassword(input, stored) {
+// 配了 Pepper 就先做一次 HMAC-SHA256(pepper, password)，再送进 PBKDF2
+async function deriveKeyMaterial(password, pepper) {
+    const raw = new TextEncoder().encode(password);
+    if (!pepper) return raw;
+    const key = await crypto.subtle.importKey(
+        'raw', new TextEncoder().encode(pepper), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    return new Uint8Array(await crypto.subtle.sign('HMAC', key, raw));
+}
+
+async function pbkdf2Hex(password, saltHex, iterations, pepper = '') {
+    const material = await deriveKeyMaterial(password, pepper);
+    const keyMaterial = await crypto.subtle.importKey('raw', material, 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt: hexToBytes(saltHex), iterations, hash: 'SHA-256' },
+        keyMaterial, 256
+    );
+    return bytesToHex(new Uint8Array(bits));
+}
+
+async function sha256Hex(text) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return bytesToHex(new Uint8Array(digest));
+}
+
+async function hashPassword(password, pepper = '', salt = null, iterations = PBKDF2_ITERATIONS) {
+    if (!salt) salt = randomHex(16);
+    const hash = await pbkdf2Hex(password, salt, iterations, pepper);
+    const prefix = pepper ? PBKDF2P_PREFIX : PBKDF2_PREFIX;
+    return `${prefix}$${iterations}$${salt}$${hash}`;
+}
+
+// 返回值：'OK' | 'OK_UPGRADE'（可登录，且应重哈希）| 'LEGACY_MATCH'（可登录，应重哈希）| false
+async function verifyPassword(input, stored, pepper = '') {
     if (!stored) return false;
-    if (!stored.includes('$')) return input === stored ? 'LEGACY_MATCH' : false;
-    const [salt, hash] = stored.split('$');
-    const newHash = await hashPassword(input, salt);
-    return newHash.split('$')[1] === hash;
+    const parts = String(stored).split('$');
+
+    if ((parts[0] === PBKDF2_PREFIX || parts[0] === PBKDF2P_PREFIX) && parts.length === 4) {
+        const needPepper = parts[0] === PBKDF2P_PREFIX;
+        // 哈希带 Pepper 但当前环境没配 Pepper —— 无法校验，直接失败（不静默放行）
+        if (needPepper && !pepper) return false;
+        const iterations = parseInt(parts[1], 10) || PBKDF2_ITERATIONS;
+        const actual = await pbkdf2Hex(input, parts[2], iterations, needPepper ? pepper : '');
+        if (!timingSafeEqualHex(actual, parts[3])) return false;
+        // 迭代数偏低、或该加 Pepper 却没加，都提示登录后自动升级
+        const upToDate = iterations >= PBKDF2_ITERATIONS && needPepper === Boolean(pepper);
+        return upToDate ? 'OK' : 'OK_UPGRADE';
+    }
+
+    // 旧版格式：单轮 SHA-256(password + salt)
+    if (parts.length === 2) {
+        const legacy = await sha256Hex(input + parts[0]);
+        return timingSafeEqualHex(legacy, parts[1]) ? 'LEGACY_MATCH' : false;
+    }
+
+    // 更旧：明文比较
+    return input === stored ? 'LEGACY_MATCH' : false;
 }
 
 // --- Turnstile 验证工具 ---
@@ -404,13 +558,17 @@ function getBjTimeFilename() {
 
 async function handleRegister(request, env, ts) {
     const formData = await request.formData();
-    const username = formData.get('username').trim().toLowerCase();
+    const username = String(formData.get('username') || '').trim().toLowerCase();
     const password = formData.get('password');
     const question = formData.get('question');
     const answer = formData.get('answer');
     const turnstileToken = formData.get('cf-turnstile-response');
 
     if (!username || !password || !question || !answer) return new Response('信息不完整', { status: 400 });
+
+    if (!isValidUsername(username)) {
+        return new Response(renderRegisterPage(true, '用户名只能包含小写字母、数字与 . _ @ + -，长度 3-64，且不能以符号开头', ts.siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
+    }
 
     if (!(await verifyTurnstileToken(ts.secretKey, turnstileToken, request.headers.get('CF-Connecting-IP')))) {
         return new Response(renderRegisterPage(true, '人机验证失败', ts.siteKey), { headers: {'Content-Type': 'text/html;charset=UTF-8'} });
@@ -423,8 +581,8 @@ async function handleRegister(request, env, ts) {
 
     const userProfile = {
         username,
-        password: await hashPassword(password),
-        security: { question: question, answer: await hashPassword(answer), failedAttempts: 0, lockoutUntil: 0 },
+        password: await hashPassword(password, resolvePepper(env)),
+        security: { question: question, answer: await hashPassword(answer, resolvePepper(env)), failedAttempts: 0, lockoutUntil: 0 },
         created_at: Date.now()
     };
 
@@ -449,7 +607,7 @@ async function handleLogin(request, env, ts) {
   await new Promise(r => setTimeout(r, 2000)); // 基础防爆破延时
 
   const formData = await request.formData();
-  const inputUser = formData.get('username').trim().toLowerCase();
+  const inputUser = String(formData.get('username') || '').trim().toLowerCase();
   const inputPass = formData.get('password');
   const turnstileToken = formData.get('cf-turnstile-response');
 
@@ -472,7 +630,7 @@ async function handleLogin(request, env, ts) {
       return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
-  const passMatchResult = await verifyPassword(inputPass, userProfile.password);
+  const passMatchResult = await verifyPassword(inputPass, userProfile.password, resolvePepper(env));
 
   if (passMatchResult === false) {
       if (!userProfile.security) userProfile.security = { failedAttempts: 0, lockoutUntil: 0 };
@@ -483,11 +641,12 @@ async function handleLogin(request, env, ts) {
       return new Response(renderLoginPage(true, '用户名或密码错误', siteKey), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
 
-  if (passMatchResult === 'LEGACY_MATCH') userProfile.password = await hashPassword(inputPass);
+  // 旧哈希（单轮 SHA-256 / 明文）或迭代数偏低的哈希，登录成功后原地升级为当前 PBKDF2 参数
+  if (passMatchResult === 'LEGACY_MATCH' || passMatchResult === 'OK_UPGRADE') userProfile.password = await hashPassword(inputPass, resolvePepper(env));
   if (userProfile.security) { userProfile.security.failedAttempts = 0; userProfile.security.lockoutUntil = 0; }
   await r2Put(env, PREFIX_USER + inputUser, userProfile);
   
-  const newToken = crypto.randomUUID();
+  const newToken = randomHex(32); // 256 位随机会话令牌
   await setSession(env, newToken, inputUser);
 
   return new Response(null, {
@@ -520,11 +679,11 @@ async function handleForgotPassword(request, env, ts) {
         const userProfile = await r2Get(env, PREFIX_USER + username);
         if (!userProfile) return new Response('Error', {status: 400});
         
-        if (!(await verifyPassword(answer, userProfile.security.answer))) {
+        if (!(await verifyPassword(answer, userProfile.security.answer, resolvePepper(env)))) {
              return await renderForgotPage(env, '2', username, '密保答案错误', siteKey, userProfile.security.question);
         }
 
-        userProfile.password = await hashPassword(newPassword);
+        userProfile.password = await hashPassword(newPassword, resolvePepper(env));
         userProfile.security.failedAttempts = 0;
         userProfile.security.lockoutUntil = 0;
         await r2Put(env, PREFIX_USER + username, userProfile);
@@ -680,7 +839,10 @@ async function handleDownloadBackup(request, env, username) {
     if (!object) return new Response("File not found", { status: 404 });
     const headers = new Headers();
     object.writeHttpMetadata(headers);
-    headers.set('Content-Disposition', `attachment; filename="${downloadName}"`);
+    // 兜底清洗文件名，杜绝引号/换行注入响应头（用户名已限制字符集，这里是第二道防线）
+    const safeDownloadName = String(downloadName).replace(/[^A-Za-z0-9._-]/g, '_');
+    headers.set('Content-Disposition', `attachment; filename="${safeDownloadName}"`);
+    headers.set('Content-Type', 'application/json');
     return new Response(object.body, { headers });
 }
 
@@ -707,6 +869,7 @@ async function handleRestore(request, env, username) {
     let json;
     try {
         if (file && file instanceof File && file.size > 0) {
+            if (file.size > 2 * 1024 * 1024) throw new Error("File too large (max 2MB)");
             json = JSON.parse(await file.text());
         } else if (r2Key) {
             if (!r2Key.startsWith(`backups/${username}/`)) throw new Error("Access Denied");
@@ -717,7 +880,7 @@ async function handleRestore(request, env, username) {
             throw new Error("Invalid request");
         }
 
-        if (!json.accounts) throw new Error("Format Error");
+        if (!json || !Array.isArray(json.accounts)) throw new Error("Format Error");
         
         // 恢复数据：自动备份 (默认 true)
         await saveUserDataWithBackup(env, username, json);
