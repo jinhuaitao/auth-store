@@ -165,13 +165,21 @@ npx wrangler secret put PBKDF2_PEPPER
 
 ### 3. 安全响应头
 
-所有响应统一附加：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`、`Cross-Origin-Opener-Policy: same-origin`、`X-Robots-Tag: noindex`、`Strict-Transport-Security`。
+所有响应统一附加：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: same-origin`、`Permissions-Policy`、`Cross-Origin-Opener-Policy: same-origin`、`X-Robots-Tag: noindex`、`Strict-Transport-Security`。
+
+> ⚠️ `Referrer-Policy` 用 `same-origin` 而不是 `no-referrer`。**`Origin` 请求头是由 referrer policy 派生的** —— 一旦设成 `no-referrer`，浏览器会把同源 POST 的 `Origin` 写成字面量 `null`，导致下面第 4 条的 CSRF 校验把所有正常提交全部误杀（返回 403）。`same-origin` 既保留同源请求的真实 `Origin`，又不会把 `Referer` 泄漏给外部站点。
 
 CSP 保留了 `'unsafe-inline'`（页面大量使用内联脚本与 `onclick`，去掉会直接让界面失效），但仍能限制外部脚本/连接来源、**禁止被 iframe 嵌套**（防点击劫持）、禁用 `object` / `base` 逃逸。
 
 ### 4. CSRF 纵深防御
 
-所有状态变更请求（POST）都会校验 `Origin`（其次 `Referer`）是否同源，跨站请求直接返回 **403**，与 `SameSite=Lax` 的会话 Cookie 叠加生效。
+所有状态变更请求（POST）都会做同源校验，判定顺序：
+
+1. `Origin` 是真实来源 → 比对 host，不同源返回 **403**；
+2. `Origin` 缺失、或是字面量 `null`（sandbox iframe / referrer policy 抑制等）→ 退回看 `Referer`，不同源返回 **403**；
+3. 两者都无法判定 → 放行。
+
+第 3 条不是放水：真正的防线是 `SameSite=Lax` 的会话 Cookie，跨站 POST 根本带不上 Cookie。这一层只是加码，所以宁可少拦，也不能把正常用户锁在门外。
 
 ### 5. 其他
 

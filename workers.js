@@ -120,7 +120,10 @@ const SECURITY_HEADERS = {
     ].join('; '),
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer',
+    // 注意：不能用 no-referrer —— Origin 头由 referrer policy 派生，no-referrer 会让
+    // 浏览器把同源 POST 的 Origin 写成字面量 "null"，从而被下面的同源校验误杀。
+    // same-origin 既能保住同源请求的真实 Origin，又不会把 Referer 泄漏给外站。
+    'Referrer-Policy': 'same-origin',
     'Permissions-Policy': 'camera=(self), microphone=(), geolocation=(), payment=()',
     'Cross-Origin-Opener-Policy': 'same-origin',
     'X-Robots-Tag': 'noindex, nofollow',
@@ -137,12 +140,15 @@ function withSecurityHeaders(response) {
     });
 }
 
-// 同源校验：Origin 优先，其次 Referer；两者都缺失（少数非浏览器客户端）时放行，
-// 仍由会话 Cookie 兜底。注意这不能替代 SameSite，二者叠加才构成 CSRF 纵深防御。
+// 同源校验（CSRF 纵深防御）：
+//  - Origin 是真实来源时，比对 host；
+//  - Origin 缺失、或为字面量 "null"（sandbox iframe / referrer policy 抑制等）时，退回看 Referer；
+//  - 两者都判定不了时放行 —— 真正的防线是 SameSite=Lax 的会话 Cookie，这里只做加码。
+//    宁可少拦，也不能把正常用户锁在门外（曾因 Referrer-Policy: no-referrer 误杀全部同源 POST）。
 function isSameOriginRequest(request, url) {
     const origin = request.headers.get('Origin');
-    if (origin) {
-        try { return new URL(origin).host === url.host; } catch (e) { return false; }
+    if (origin && origin !== 'null') {
+        try { return new URL(origin).host === url.host; } catch (e) { /* 解析不了，继续看 Referer */ }
     }
     const referer = request.headers.get('Referer');
     if (referer) {
