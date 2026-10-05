@@ -852,15 +852,26 @@ async function handleDownloadBackup(request, env, username) {
     return new Response(object.body, { headers });
 }
 
+// 只保留「备份目录下的直接子文件」，并排除 0 字节对象。
+// 背景：在 R2 控制台「新建文件夹」会写入一个 key 以 "/" 结尾的 0 字节占位对象，
+// list() 会把它一并返回；前端解析文件名后得到的是一个**空白条目**，点「恢复」必然失败。
+// 因此这里在服务端就把它过滤掉，前端拿到的列表里不会再出现空条目。
+function pickBackupFiles(objects, prefix) {
+    return (objects || [])
+        .filter(obj => {
+            const rest = String(obj.key).slice(prefix.length);
+            return rest.length > 0 && rest.indexOf('/') === -1 && obj.size !== 0;
+        })
+        .map(obj => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded }))
+        // R2 list() 按 key 字典序升序返回，这里显式降序排出「最新的在最前」
+        .sort((a, b) => String(b.key).localeCompare(String(a.key)));
+}
+
 async function handleListBackups(env, username) {
     try {
-        const list = await env.DB.list({ prefix: `backups/${username}/` });
-        // R2 list() 按 key 字典序升序返回，这里显式降序排出「最新的在最前」，
-        // 不依赖底层返回顺序。原来用的 reverse() 是原地翻转，语义不如显式排序清晰。
-        const files = (list.objects || [])
-            .map(obj => ({ key: obj.key, size: obj.size, uploaded: obj.uploaded }))
-            .sort((a, b) => String(b.key).localeCompare(String(a.key)));
-        return jsonResponse(files);
+        const prefix = `backups/${username}/`;
+        const list = await env.DB.list({ prefix });
+        return jsonResponse(pickBackupFiles(list.objects, prefix));
     } catch (e) {
         // 兜底：把异常转成 JSON，前端才能显示可读原因，而不是拿到一个 500 HTML 错误页
         return jsonResponse({ error: 'list_failed', message: String((e && e.message) || e) }, 500);
@@ -876,12 +887,23 @@ async function handleRestore(request, env, username) {
     try {
         if (file && file instanceof File && file.size > 0) {
             if (file.size > 2 * 1024 * 1024) throw new Error("File too large (max 2MB)");
-            json = JSON.parse(await file.text());
+            try {
+                json = JSON.parse(await file.text());
+            } catch (e) {
+                throw new Error("上传的文件不是有效的 JSON");
+            }
         } else if (r2Key) {
             if (!r2Key.startsWith(`backups/${username}/`)) throw new Error("Access Denied");
+            // 目录占位符（key 以 "/" 结尾）不是备份文件，给出明确提示而不是让它走到解析失败
+            if (String(r2Key).endsWith('/')) throw new Error("该条目不是备份文件");
             const obj = await env.DB.get(r2Key);
             if (!obj) throw new Error("Backup not found");
-            json = await obj.json();
+            if (obj.size === 0) throw new Error("该备份文件为空，无法恢复");
+            try {
+                json = await obj.json();
+            } catch (e) {
+                throw new Error("备份文件不是有效的 JSON");
+            }
         } else {
             throw new Error("Invalid request");
         }
@@ -1684,14 +1706,16 @@ function renderDashboard(username, accounts, opts) {
           if (!Array.isArray(files)) {
               return renderBackupError(container, mode, '备份列表格式异常');
           }
-          if (files.length === 0) {
+          // 双保险：即使服务端漏掉，这里也把解析不出文件名的异常条目（如 R2 文件夹占位符）过滤掉
+          const valid = files.filter(function (f) { return fmtBackupName(f.key); });
+          if (valid.length === 0) {
               container.innerHTML = '<div class="text-center text-sub" style="padding:20px;">暂无历史备份<br><span style="font-size:0.8rem;opacity:0.7">增删账户后会自动生成备份</span></div>';
               return;
           }
 
           // 用 DOM 构建而不是拼 HTML 字符串：既免去多层引号转义，也天然免疫 XSS
           container.innerHTML = '';
-          files.forEach(function (f) {
+          valid.forEach(function (f) {
               const display = fmtBackupName(f.key);
 
               const label = document.createElement('div');
